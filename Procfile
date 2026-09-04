@@ -1,1 +1,1 @@
-worker: python update.py; python -m bot
+worker: python -m bot
