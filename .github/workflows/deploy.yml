@@ -1,0 +1,136 @@
+name: Deploy to Heroku
+
+on:
+  workflow_dispatch:
+    inputs:
+      HEROKU_APP_NAME:
+        description: "Heroku App name"
+        required: true
+      HEROKU_API_KEY:
+        description: "Heroku API key"
+        required: true
+      HEROKU_EMAIL:
+        description: "Heroku email address"
+        required: true
+      HEROKU_TEAM_NAME:
+        description: "Heroku Team Name"
+        required: false
+        default: ""
+      BOT_TOKEN:
+        description: "Telegram bot token"
+        required: true
+      OWNER_ID:
+        description: "Owner's telegram ID"
+        required: true
+      CHANNEL_ID:
+        description: "Telegram channel ID (e.g. -100…)"
+        required: true
+      TELEGRAM_API:
+        description: "Telegram API ID from https://my.telegram.org/"
+        required: true
+      TELEGRAM_HASH:
+        description: "Telegram HASH from https://my.telegram.org/"
+        required: true
+      DATABASE_URL:
+        description: "MongoDB URL (optional but recommended)"
+        required: false
+        default: ""
+      QOBUZ_APP_ID:
+        description: "Qobuz app_id"
+        required: true
+      QOBUZ_SECRET:
+        description: "Qobuz app secret"
+        required: true
+      QOBUZ_AUTH_TOKENS:
+        description: "Qobuz auth token(s), comma-separated"
+        required: true
+      QUALITY:
+        description: "Qobuz quality (hi-res-192 / hi-res / cd)"
+        required: false
+        default: "hi-res-192"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Heroku CLI
+        run: |
+          curl https://cli-assets.heroku.com/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          heroku version
+
+      - name: Heroku login
+        env:
+          HEROKU_API_KEY: ${{ inputs.HEROKU_API_KEY }}
+          HEROKU_EMAIL: ${{ inputs.HEROKU_EMAIL }}
+        run: |
+          cat > ~/.netrc << EOF
+machine api.heroku.com
+  login ${HEROKU_EMAIL}
+  password ${HEROKU_API_KEY}
+machine git.heroku.com
+  login ${HEROKU_EMAIL}
+  password ${HEROKU_API_KEY}
+EOF
+          chmod 600 ~/.netrc
+          heroku auth:whoami
+
+      - name: Ensure Heroku app
+        env:
+          APP: ${{ inputs.HEROKU_APP_NAME }}
+          TEAM: ${{ inputs.HEROKU_TEAM_NAME }}
+        run: |
+          if heroku apps:info -a "$APP" >/dev/null 2>&1; then
+            echo "App $APP exists"
+          else
+            if [ -n "$TEAM" ]; then
+              heroku create "$APP" --team "$TEAM"
+            else
+              heroku create "$APP"
+            fi
+          fi
+
+      - name: Set Config Vars
+        env:
+          APP: ${{ inputs.HEROKU_APP_NAME }}
+        run: |
+          heroku config:set -a "$APP" \
+            BOT_TOKEN="${{ inputs.BOT_TOKEN }}" \
+            OWNER_ID="${{ inputs.OWNER_ID }}" \
+            CHANNEL_ID="${{ inputs.CHANNEL_ID }}" \
+            TELEGRAM_API="${{ inputs.TELEGRAM_API }}" \
+            TELEGRAM_HASH="${{ inputs.TELEGRAM_HASH }}" \
+            DATABASE_URL="${{ inputs.DATABASE_URL }}" \
+            QOBUZ_APP_ID="${{ inputs.QOBUZ_APP_ID }}" \
+            QOBUZ_SECRET="${{ inputs.QOBUZ_SECRET }}" \
+            QOBUZ_AUTH_TOKENS="${{ inputs.QOBUZ_AUTH_TOKENS }}" \
+            QUALITY="${{ inputs.QUALITY }}" \
+            SEND_TRACKS=true \
+            DELETE_AFTER_POST=true \
+            UPSTREAM_REPO="https://github.com/zenin-373/Qobuz-TG" \
+            UPSTREAM_BRANCH=main \
+            HEROKU_APP_NAME="${{ inputs.HEROKU_APP_NAME }}" \
+            HEROKU_API_KEY="${{ inputs.HEROKU_API_KEY }}"
+
+      - name: Python buildpack
+        run: heroku buildpacks:set heroku/python -a "${{ inputs.HEROKU_APP_NAME }}" || true
+
+      - name: Deploy
+        env:
+          HEROKU_API_KEY: ${{ inputs.HEROKU_API_KEY }}
+          APP: ${{ inputs.HEROKU_APP_NAME }}
+        run: |
+          git remote remove heroku 2>/dev/null || true
+          git remote add heroku "https://heroku:${HEROKU_API_KEY}@git.heroku.com/${APP}.git"
+          git push heroku HEAD:refs/heads/main --force
+
+      - name: Scale worker
+        run: |
+          APP="${{ inputs.HEROKU_APP_NAME }}"
+          heroku ps:scale worker=1 web=0 -a "$APP" || heroku ps:scale worker=1 -a "$APP"
+          heroku ps -a "$APP"
