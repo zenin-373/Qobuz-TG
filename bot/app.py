@@ -1,7 +1,6 @@
 """Qobuz-TG: download → poster + music → delete.
 
-Uses wzgram (Pyrogram fork) over MTProto — same idea as Aeon:
-bot token alone can upload up to ~2 GB (no USER_SESSION_STRING required).
+Uses wzgram (Pyrogram fork) over MTProto — ~2 GB with bot token only.
 """
 
 from __future__ import annotations
@@ -9,14 +8,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import sys
 from pathlib import Path
 
 try:
     from wzgram import Client, filters, idle
     from wzgram.types import Message
-except ImportError:  # fallback if only pyrogram installed
+
+    log_lib = "wzgram"
+except ImportError:
     from pyrogram import Client, filters, idle
     from pyrogram.types import Message
+
+    log_lib = "pyrogram"
 
 from bot.db import (
     add_token,
@@ -25,7 +29,6 @@ from bot.db import (
     mask_token,
     merge_config,
     persist_cfg,
-    save_to_mongo,
     set_app_creds,
 )
 from bot.env_config import load_config
@@ -35,6 +38,7 @@ from bot.qobuz_worker import cleanup, meta_from_folder, run_download
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
     level=logging.INFO,
+    stream=sys.stdout,
 )
 log = logging.getLogger("qobuz-tg")
 
@@ -43,9 +47,7 @@ PLAIN_RE = re.compile(
     re.I,
 )
 AUDIO_EXTS = {".flac", ".mp3", ".m4a", ".wav", ".ogg"}
-
-# MTProto bot/user limit (Aeon / Pyrogram / wzgram style — NOT HTTP Bot API 50MB)
-UPLOAD_LIMIT = 2 * 1024 * 1024 * 1024  # 2 GB
+UPLOAD_LIMIT = 2 * 1024 * 1024 * 1024
 
 CMD_BLOCK = [
     "start",
@@ -68,9 +70,16 @@ def _load_config():
 
 
 def _allowed(user_id: int, cfg) -> bool:
-    owners = {int(cfg.OWNER_ID)}
+    try:
+        owners = {int(cfg.OWNER_ID)}
+    except (TypeError, ValueError):
+        owners = set()
     extra = getattr(cfg, "AUTHORIZED_IDS", []) or []
-    owners.update(int(x) for x in extra if x)
+    for x in extra:
+        try:
+            owners.add(int(x))
+        except (TypeError, ValueError):
+            pass
     return int(user_id) in owners
 
 
@@ -83,18 +92,12 @@ def _list_audio(album_dir: Path) -> list[Path]:
 
 
 async def _send_tracks(client, user_client, chat_id, files, cfg, status):
-    """Upload via MTProto. Bot client alone supports ~2GB (like Aeon without session)."""
     sent, skipped = 0, 0
-    # Prefer user client if present; otherwise bot MTProto (2GB)
     sender = user_client if user_client is not None else client
-    mode = "user/2GB" if user_client is not None else "bot/MTProto/2GB"
-    log.info("Upload mode: %s (%d files)", mode, len(files))
-
     for i, path in enumerate(files, 1):
         size = path.stat().st_size
         if size > UPLOAD_LIMIT:
             skipped += 1
-            log.warning("Skip %s (%.1f MB > 2GB)", path.name, size / 1024 / 1024)
             continue
         try:
             await status.edit_text(f"🎵 Uploading {i}/{len(files)}: {path.name}")
@@ -115,7 +118,10 @@ async def _send_tracks(client, user_client, chat_id, files, cfg, status):
 
 async def _run_job(client, message, kind, id_, cfg, user_client):
     if not message.from_user or not _allowed(message.from_user.id, cfg):
-        await message.reply_text("Unauthorized.")
+        uid = message.from_user.id if message.from_user else "?"
+        await message.reply_text(
+            f"Unauthorized.\nYour id: `{uid}`\nSet OWNER_ID or AUTHORIZED_IDS to this."
+        )
         return
 
     status = await message.reply_text(f"⏳ {kind} `{id_}` — starting…")
@@ -147,7 +153,7 @@ async def _run_job(client, message, kind, id_, cfg, user_client):
                 total_skip += k
 
         await status.edit_text(
-            f"✅ Done (MTProto ~2GB)\nPosters: {posted}\nTracks sent: {total_sent}\n"
+            f"✅ Done\nPosters: {posted}\nTracks sent: {total_sent}\n"
             f"Skipped: {total_skip}\nLocal files deleted."
         )
     except Exception as exc:
@@ -162,11 +168,26 @@ async def _run_job(client, message, kind, id_, cfg, user_client):
 
 
 def main() -> None:
+    log.info("Loading config (lib=%s)…", log_lib)
     cfg = _load_config()
+
+    if not str(getattr(cfg, "BOT_TOKEN", "") or "").strip():
+        raise SystemExit("BOT_TOKEN missing")
+    if not getattr(cfg, "TELEGRAM_API", None):
+        raise SystemExit("TELEGRAM_API missing")
+    if not str(getattr(cfg, "TELEGRAM_HASH", "") or "").strip():
+        raise SystemExit("TELEGRAM_HASH missing")
+
     api_id = int(cfg.TELEGRAM_API)
     api_hash = str(cfg.TELEGRAM_HASH)
     sessions = Path(getattr(cfg, "TEMP_DIR", "/tmp/qobuz-tg")) / "sessions"
     sessions.mkdir(parents=True, exist_ok=True)
+
+    log.info(
+        "OWNER_ID=%s CHANNEL_ID=%s",
+        getattr(cfg, "OWNER_ID", None),
+        getattr(cfg, "CHANNEL_ID", None),
+    )
 
     app = Client(
         "qobuz_tg_bot",
@@ -189,19 +210,29 @@ def main() -> None:
 
     @app.on_message(filters.command(["start", "help"]))
     async def cmd_start(_, message: Message):
-        if not message.from_user or not _allowed(message.from_user.id, cfg):
-            await message.reply_text("Unauthorized.")
-            return
-        await message.reply_text(
-            "**Qobuz-TG** (wzgram/MTProto · ~2GB uploads)\n\n"
-            "**Download**\n"
-            "`/al_id <id>` `/ar_id <id>` `/tr_id <id>`\n\n"
-            "**Qobuz**\n"
-            "`/qobuz` `/qobuz_list` `/qobuz_add` `/qobuz_del`\n"
-            "`/qobuz_setapp` `/qobuz_quality` `/save_config`\n\n"
-            "No USER_SESSION_STRING needed for 2GB (same as Aeon).",
-            quote=True,
+        # Always reply so you know the bot is alive
+        uid = message.from_user.id if message.from_user else None
+        ok = uid is not None and _allowed(uid, cfg)
+        text = (
+            f"**Qobuz-TG online** ({log_lib})\n"
+            f"Your id: `{uid}`\n"
+            f"Authorized: **{'yes' if ok else 'no'}**\n"
+            f"OWNER_ID config: `{getattr(cfg, 'OWNER_ID', '')}`\n\n"
         )
+        if ok:
+            text += (
+                "**Download**\n"
+                "`/al_id <id>` `/ar_id <id>` `/tr_id <id>`\n\n"
+                "**Qobuz**\n"
+                "`/qobuz` `/qobuz_add` `/qobuz_del` `/qobuz_list`\n"
+                "`/qobuz_setapp` `/qobuz_quality` `/save_config`"
+            )
+        else:
+            text += (
+                "Not authorized to download.\n"
+                "Set Heroku config `OWNER_ID` to your id above, then restart the dyno."
+            )
+        await message.reply_text(text, quote=True)
 
     @app.on_message(filters.command("al_id"))
     async def cmd_al(_, message: Message):
@@ -234,9 +265,7 @@ def main() -> None:
             f"app_id: `{getattr(cfg, 'QOBUZ_APP_ID', '')}`\n"
             f"secret: `{mask_token(str(getattr(cfg, 'QOBUZ_SECRET', '')))}`\n"
             f"tokens: **{len(toks)}**\n"
-            f"quality: `{getattr(cfg, 'QUALITY', '')}`\n"
-            f"upload: `MTProto ~2GB`\n"
-            f"mongo: `{'yes' if getattr(cfg, 'DATABASE_URL', '') else 'no'}`"
+            f"quality: `{getattr(cfg, 'QUALITY', '')}`"
         )
 
     @app.on_message(filters.command("qobuz_list"))
@@ -245,7 +274,7 @@ def main() -> None:
             return await message.reply_text("Unauthorized.")
         toks = list_tokens(cfg)
         if not toks:
-            return await message.reply_text("No tokens. Add with `/qobuz_add <token>`")
+            return await message.reply_text("No tokens.")
         lines = [f"{i}. `{mask_token(t)}`" for i, t in enumerate(toks, 1)]
         await message.reply_text("**Tokens**\n" + "\n".join(lines))
 
@@ -255,7 +284,7 @@ def main() -> None:
             return await message.reply_text("Unauthorized.")
         parts = (message.text or "").split(maxsplit=1)
         if len(parts) < 2:
-            return await message.reply_text("Usage: /qobuz_add <auth_token>")
+            return await message.reply_text("Usage: /qobuz_add <token>")
         n = add_token(cfg, parts[1].strip())
         await message.reply_text(f"✅ Token added. Total: {n}")
 
@@ -265,7 +294,7 @@ def main() -> None:
             return await message.reply_text("Unauthorized.")
         parts = (message.text or "").split()
         if len(parts) < 2 or not parts[1].isdigit():
-            return await message.reply_text("Usage: /qobuz_del <number>")
+            return await message.reply_text("Usage: /qobuz_del <n>")
         ok = del_token(cfg, int(parts[1]))
         await message.reply_text("✅ Removed." if ok else "❌ Invalid index.")
 
@@ -277,7 +306,7 @@ def main() -> None:
         if len(parts) < 3:
             return await message.reply_text("Usage: /qobuz_setapp <app_id> <secret>")
         set_app_creds(cfg, parts[1], parts[2])
-        await message.reply_text("✅ app_id + secret updated.")
+        await message.reply_text("✅ Updated.")
 
     @app.on_message(filters.command("qobuz_quality"))
     async def cmd_qobuz_quality(_, message: Message):
@@ -286,21 +315,17 @@ def main() -> None:
         parts = (message.text or "").split()
         allowed = {"hi-res-192", "hi-res", "cd", "mp3"}
         if len(parts) < 2 or parts[1] not in allowed:
-            return await message.reply_text(
-                "Usage: /qobuz_quality <hi-res-192|hi-res|cd|mp3>"
-            )
+            return await message.reply_text("Usage: /qobuz_quality <hi-res-192|hi-res|cd|mp3>")
         cfg.QUALITY = parts[1]
         persist_cfg(cfg)
-        await message.reply_text(f"✅ Quality set to `{parts[1]}`")
+        await message.reply_text(f"✅ Quality `{parts[1]}`")
 
     @app.on_message(filters.command("save_config"))
     async def cmd_save(_, message: Message):
         if not message.from_user or not _allowed(message.from_user.id, cfg):
             return await message.reply_text("Unauthorized.")
         ok = persist_cfg(cfg)
-        await message.reply_text(
-            "Saved to MongoDB." if ok else "Failed — set DATABASE_URL."
-        )
+        await message.reply_text("Saved." if ok else "Need DATABASE_URL.")
 
     @app.on_message(filters.text & ~filters.command(CMD_BLOCK))
     async def plain(_, message: Message):
@@ -318,16 +343,14 @@ def main() -> None:
             user_client,
         )
 
-    log.info("Qobuz-TG starting (wzgram/MTProto)…")
+    log.info("Starting client…")
 
     async def runner():
         await app.start()
         if user_client:
             await user_client.start()
-            log.info("User session started")
-        log.info("Bot MTProto uploads enabled (~2GB, no session string required)")
         me = await app.get_me()
-        log.info("Bot @%s", me.username)
+        log.info("Bot online @%s (id=%s)", me.username, me.id)
         await idle()
         await app.stop()
         if user_client:
