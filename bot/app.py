@@ -15,6 +15,7 @@ from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 
 from bot.db import merge_config, save_to_mongo
+from bot.env_config import load_config
 from bot.poster import caption_from_album_meta, find_cover
 from bot.qobuz_worker import cleanup, meta_from_folder, run_download
 
@@ -33,12 +34,7 @@ AUDIO_EXTS = {".flac", ".mp3", ".m4a", ".wav", ".ogg"}
 
 
 def _load_config():
-    try:
-        import config as cfg  # type: ignore
-    except ImportError as e:
-        raise SystemExit(
-            "Missing config.py — copy config_sample.py to config.py and edit it."
-        ) from e
+    cfg = load_config()
     return merge_config(cfg)
 
 
