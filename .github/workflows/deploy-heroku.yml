@@ -1,19 +1,45 @@
 name: Deploy to Heroku
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       app_name:
-        description: "Heroku app name (optional override)"
+        description: "Heroku app name (optional; defaults to HEROKU_APP_NAME secret)"
         required: false
         default: ""
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
+      - name: Check secrets
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+          HEROKU_EMAIL: ${{ secrets.HEROKU_EMAIL }}
+          HEROKU_APP_NAME: ${{ secrets.HEROKU_APP_NAME }}
+        run: |
+          missing=0
+          if [ -z "$HEROKU_API_KEY" ]; then echo "❌ Missing secret: HEROKU_API_KEY"; missing=1; fi
+          if [ -z "$HEROKU_EMAIL" ]; then echo "❌ Missing secret: HEROKU_EMAIL"; missing=1; fi
+          if [ -z "$HEROKU_APP_NAME" ] && [ -z "${{ github.event.inputs.app_name }}" ]; then
+            echo "❌ Missing secret: HEROKU_APP_NAME (or workflow input app_name)"
+            missing=1
+          fi
+          if [ "$missing" = "1" ]; then
+            echo ""
+            echo "Add these under: Repo → Settings → Secrets and variables → Actions"
+            echo "  HEROKU_API_KEY   = Heroku Account Settings → API Key"
+            echo "  HEROKU_EMAIL     = your Heroku login email"
+            echo "  HEROKU_APP_NAME  = your heroku app name"
+            exit 1
+          fi
+          echo "✓ Secrets present"
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -22,73 +48,61 @@ jobs:
       - name: Install Heroku CLI
         run: |
           curl https://cli-assets.heroku.com/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
           heroku version
-
-      - name: Install GitHub CLI
-        run: |
-          (type -p wget >/dev/null || (sudo apt update && sudo apt-get install wget -y)) \
-            && sudo mkdir -p -m 755 /etc/apt/keyrings \
-            && out=$(mktemp) && wget -nv -O$out https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-            && cat $out | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
-            && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
-            && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
-            && sudo apt update \
-            && sudo apt install gh -y
-          gh --version
 
       - name: Set app name
         id: app
         run: |
           NAME="${{ github.event.inputs.app_name }}"
-          if [ -z "$NAME" ]; then
-            NAME="${{ secrets.HEROKU_APP_NAME }}"
-          fi
-          if [ -z "$NAME" ]; then
-            echo "HEROKU_APP_NAME secret (or workflow input) is required"
-            exit 1
-          fi
+          if [ -z "$NAME" ]; then NAME="${{ secrets.HEROKU_APP_NAME }}"; fi
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "Deploying to app: $NAME"
 
-      - name: Login to Heroku
+      - name: Heroku login (.netrc)
         env:
           HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+          HEROKU_EMAIL: ${{ secrets.HEROKU_EMAIL }}
         run: |
-          echo "$HEROKU_API_KEY" | heroku auth:token >/dev/null 2>&1 || true
           cat > ~/.netrc << EOF
 machine api.heroku.com
-  login ${{ secrets.HEROKU_EMAIL }}
-  password ${{ secrets.HEROKU_API_KEY }}
+  login ${HEROKU_EMAIL}
+  password ${HEROKU_API_KEY}
 machine git.heroku.com
-  login ${{ secrets.HEROKU_EMAIL }}
-  password ${{ secrets.HEROKU_API_KEY }}
+  login ${HEROKU_EMAIL}
+  password ${HEROKU_API_KEY}
 EOF
           chmod 600 ~/.netrc
           heroku auth:whoami
 
-      - name: Ensure Heroku app exists
+      - name: Ensure app exists
         run: |
-          if ! heroku apps:info -a "${{ steps.app.outputs.name }}" >/dev/null 2>&1; then
-            heroku create "${{ steps.app.outputs.name }}"
+          APP="${{ steps.app.outputs.name }}"
+          if heroku apps:info -a "$APP" >/dev/null 2>&1; then
+            echo "App $APP exists"
+          else
+            echo "Creating app $APP…"
+            heroku create "$APP"
           fi
 
-      - name: Set buildpack & stack
+      - name: Python buildpack
         run: |
-          heroku buildpacks:clear -a "${{ steps.app.outputs.name }}" || true
-          heroku buildpacks:set heroku/python -a "${{ steps.app.outputs.name }}"
-          heroku stack:set heroku-24 -a "${{ steps.app.outputs.name }}" || true
+          APP="${{ steps.app.outputs.name }}"
+          heroku buildpacks:set heroku/python -a "$APP" || true
 
-      - name: Add Heroku git remote
+      - name: Deploy (git push)
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
         run: |
-          heroku git:remote -a "${{ steps.app.outputs.name }}"
+          APP="${{ steps.app.outputs.name }}"
+          # Use authenticated remote URL (more reliable than heroku git:remote alone)
+          git remote remove heroku 2>/dev/null || true
+          git remote add heroku "https://heroku:${HEROKU_API_KEY}@git.heroku.com/${APP}.git"
+          git push heroku HEAD:refs/heads/main --force
 
-      - name: Deploy to Heroku
+      - name: Scale worker only
         run: |
-          git push heroku HEAD:main --force
-
-      - name: Scale worker (no web dyno)
-        run: |
-          heroku ps:scale worker=1 web=0 -a "${{ steps.app.outputs.name }}" || \
-          heroku ps:scale worker=1 -a "${{ steps.app.outputs.name }}"
-
-      - name: Show dynos
-        run: heroku ps -a "${{ steps.app.outputs.name }}"
+          APP="${{ steps.app.outputs.name }}"
+          heroku ps:scale worker=1 web=0 -a "$APP" || heroku ps:scale worker=1 -a "$APP"
+          heroku ps -a "$APP"
