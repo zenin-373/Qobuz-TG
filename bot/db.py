@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List
 
 log = logging.getLogger("qobuz-tg.db")
 
-# Keys stored in Mongo (override config.py when present)
 STORED_KEYS = (
     "BOT_TOKEN",
     "OWNER_ID",
@@ -75,10 +74,60 @@ def save_to_mongo(database_url: str, bot_token: str, data: Dict[str, Any]) -> bo
 
 
 def merge_config(module_cfg: Any, database_url: str = "") -> Any:
-    """Apply Mongo overrides onto a config module-like object."""
     token = getattr(module_cfg, "BOT_TOKEN", "") or ""
     url = database_url or getattr(module_cfg, "DATABASE_URL", "") or ""
     overrides = load_from_mongo(url, token)
     for k, v in overrides.items():
         setattr(module_cfg, k, v)
     return module_cfg
+
+
+def cfg_snapshot(cfg: Any) -> Dict[str, Any]:
+    return {k: getattr(cfg, k) for k in dir(cfg) if k.isupper()}
+
+
+def persist_cfg(cfg: Any) -> bool:
+    """Write full config snapshot to Mongo if DATABASE_URL is set."""
+    url = getattr(cfg, "DATABASE_URL", "") or ""
+    token = getattr(cfg, "BOT_TOKEN", "") or ""
+    if not url:
+        return False
+    return save_to_mongo(url, token, cfg_snapshot(cfg))
+
+
+def mask_token(t: str) -> str:
+    t = t.strip()
+    if len(t) <= 10:
+        return "***"
+    return t[:6] + "…" + t[-4:]
+
+
+def list_tokens(cfg: Any) -> List[str]:
+    toks = list(getattr(cfg, "QOBUZ_AUTH_TOKENS", []) or [])
+    return [str(x) for x in toks if str(x).strip()]
+
+
+def add_token(cfg: Any, token: str) -> int:
+    token = token.strip()
+    toks = list_tokens(cfg)
+    if token not in toks:
+        toks.append(token)
+    cfg.QOBUZ_AUTH_TOKENS = toks
+    persist_cfg(cfg)
+    return len(toks)
+
+
+def del_token(cfg: Any, index: int) -> bool:
+    toks = list_tokens(cfg)
+    if index < 1 or index > len(toks):
+        return False
+    toks.pop(index - 1)
+    cfg.QOBUZ_AUTH_TOKENS = toks
+    persist_cfg(cfg)
+    return True
+
+
+def set_app_creds(cfg: Any, app_id: str, secret: str) -> None:
+    cfg.QOBUZ_APP_ID = app_id.strip()
+    cfg.QOBUZ_SECRET = secret.strip()
+    persist_cfg(cfg)
