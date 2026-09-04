@@ -25,74 +25,87 @@ Plain text also works: `al-id 123`, `ar-id 123`, `tr-id 123`.
   → delete temp files
 ```
 
-Poster caption:
+## Deploy to Heroku (GitHub Actions)
+
+Files:
+
+- `heroku.yml` — worker process
+- `Procfile` — `worker: python update.py; python -m bot`
+- `.github/workflows/deploy-heroku.yml` — deploy on push to `main`
+
+### 1. GitHub secrets
+
+Repo → **Settings → Secrets and variables → Actions**:
+
+| Secret | Value |
+|--------|--------|
+| `HEROKU_API_KEY` | Heroku Account → API Key |
+| `HEROKU_EMAIL` | Heroku login email |
+| `HEROKU_APP_NAME` | Your app name (e.g. `qobuz-tg-bot`) |
+
+### 2. Heroku Config Vars
+
+App → **Settings → Config Vars** (required):
 
 ```text
-📖 Album Title
-🎤 Artist: ...
-📅 Year: ...
-🎵 Tracks: ...
-🎧 Quality: ...
-🏷️ Genre: ...
+BOT_TOKEN
+OWNER_ID
+CHANNEL_ID
+TELEGRAM_API
+TELEGRAM_HASH
+QOBUZ_APP_ID
+QOBUZ_SECRET
+QOBUZ_AUTH_TOKENS          # comma-separated tokens
+DATABASE_URL               # optional MongoDB
+SEND_TRACKS=true
+DELETE_AFTER_POST=true
+QUALITY=hi-res-192
 ```
 
-## Config (Aeon-MLTB style)
+### 3. Deploy
 
-Copy `config_sample.py` → `config.py`:
+- Push to `main`, or
+- **Actions → Deploy to Heroku → Run workflow**
+
+Worker dyno is scaled to `1` (no web dyno).
+
+### Manual Heroku CLI
+
+```bash
+heroku create your-app-name
+heroku buildpacks:set heroku/python
+git push heroku main
+heroku ps:scale worker=1 web=0
+heroku config:set BOT_TOKEN=... TELEGRAM_API=... # etc
+```
+
+## Config (local)
+
+Copy `config_sample.py` → `config.py` or use env vars (Heroku).
 
 | Variable | Source |
 |----------|--------|
 | `BOT_TOKEN` | @BotFather |
-| `OWNER_ID` | @userinfobot |
-| `CHANNEL_ID` | your channel (`-100…`), bot = admin |
-| `TELEGRAM_API` | [my.telegram.org](https://my.telegram.org) api_id |
-| `TELEGRAM_HASH` | my.telegram.org api_hash |
-| `USER_SESSION_STRING` | optional — large FLAC uploads |
-| `DATABASE_URL` | MongoDB URI (store credentials) |
+| `TELEGRAM_API` / `TELEGRAM_HASH` | [my.telegram.org](https://my.telegram.org) |
+| `OWNER_ID` / `CHANNEL_ID` | Telegram ids |
+| `DATABASE_URL` | MongoDB |
 | `QOBUZ_*` | app_id, secret, tokens |
 
-`SEND_TRACKS = True` by default.
-
-### File size
-
-- **Bot only:** ~50 MB per file (`MAX_TG_FILE_MB = 49`)
-- **With `USER_SESSION_STRING`:** larger files via user client (Premium helps)
-
-Hi-Res FLACs often need the user session or lower quality (`cd` / `hi-res`).
-
-## MongoDB
-
-Set `DATABASE_URL`. On start, settings override `config.py` when present in DB.
-
-Send `/save_config` as owner to push current config into MongoDB.
-
-## Update to latest commit
+## Update
 
 ```bash
 python update.py
 ```
 
-Pulls `UPSTREAM_REPO` / `UPSTREAM_BRANCH` (keeps local `config.py`).
-
-## Setup
+## Local setup
 
 ```bash
 git clone https://github.com/zenin-373/Qobuz-TG.git
 cd Qobuz-TG
-python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 pip install git+https://github.com/zenin-373/qobuzdl-collab.git
-
 cp config_sample.py config.py
-# fill BOT_TOKEN, TELEGRAM_API, TELEGRAM_HASH, OWNER_ID, CHANNEL_ID, Qobuz tokens
-
 python -m bot
-```
-
-Optional auto-update before start:
-
-```bash
-python update.py && python -m bot
 ```
 
 ## License
