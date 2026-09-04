@@ -1,4 +1,9 @@
-"""Qobuz-TG: download → poster + music → delete. Manage Qobuz creds in Telegram."""
+"""Qobuz-TG: download → poster + music → delete.
+
+Same as Aeon-MLTB:
+  BOT_TOKEN + TELEGRAM_API + TELEGRAM_HASH  → bot client (~50 MB)
+  USER_SESSION_STRING                       → user client (~2 GB / 4 GB Premium)
+"""
 
 from __future__ import annotations
 
@@ -36,6 +41,10 @@ PLAIN_RE = re.compile(
 )
 AUDIO_EXTS = {".flac", ".mp3", ".m4a", ".wav", ".ogg"}
 
+# Aeon-style limits
+BOT_LIMIT = 50 * 1024 * 1024          # official Bot API
+USER_LIMIT = 2 * 1024 * 1024 * 1024   # user client (~2 GB; Premium can be higher)
+
 CMD_BLOCK = [
     "start",
     "help",
@@ -63,10 +72,6 @@ def _allowed(user_id: int, cfg) -> bool:
     return int(user_id) in owners
 
 
-def _max_bytes(cfg) -> int:
-    return int(float(getattr(cfg, "MAX_TG_FILE_MB", 49)) * 1024 * 1024)
-
-
 def _list_audio(album_dir: Path) -> list[Path]:
     return [
         p
@@ -76,15 +81,30 @@ def _list_audio(album_dir: Path) -> list[Path]:
 
 
 async def _send_tracks(client, user_client, chat_id, files, cfg, status):
+    """Upload tracks. If USER_SESSION_STRING is set → user client (2 GB), else bot (~50 MB)."""
     sent, skipped = 0, 0
-    limit = _max_bytes(cfg)
+    # Aeon USER_TRANSMISSION style: prefer user client for ALL media when available
+    if user_client is not None:
+        sender = user_client
+        limit = USER_LIMIT
+        mode = "user/2GB"
+    else:
+        sender = client
+        limit = BOT_LIMIT
+        mode = "bot/50MB"
+
+    log.info("Upload mode: %s (%d files)", mode, len(files))
+
     for i, path in enumerate(files, 1):
         size = path.stat().st_size
-        use_user = user_client is not None and size > limit
-        sender = user_client if use_user else client
-        effective = (2 * 1024 * 1024 * 1024) if use_user else limit
-        if size > effective:
+        if size > limit:
             skipped += 1
+            log.warning(
+                "Skip %s (%.1f MB > %s limit)",
+                path.name,
+                size / 1024 / 1024,
+                mode,
+            )
             continue
         try:
             await status.edit_text(f"🎵 Uploading {i}/{len(files)}: {path.name}")
@@ -136,8 +156,9 @@ async def _run_job(client, message, kind, id_, cfg, user_client):
                 total_sent += s
                 total_skip += k
 
+        mode = "user/2GB" if user_client else "bot/50MB"
         await status.edit_text(
-            f"✅ Done\nPosters: {posted}\nTracks sent: {total_sent}\n"
+            f"✅ Done ({mode})\nPosters: {posted}\nTracks sent: {total_sent}\n"
             f"Skipped: {total_skip}\nLocal files deleted."
         )
     except Exception as exc:
@@ -165,6 +186,8 @@ def main() -> None:
         bot_token=str(cfg.BOT_TOKEN),
         workdir=str(sessions),
     )
+
+    # Aeon-style optional user client (2 GB uploads)
     user_client = None
     us = getattr(cfg, "USER_SESSION_STRING", "") or ""
     if us.strip():
@@ -181,18 +204,15 @@ def main() -> None:
         if not message.from_user or not _allowed(message.from_user.id, cfg):
             await message.reply_text("Unauthorized.")
             return
+        mode = "user/2GB" if user_client else "bot/50MB"
         await message.reply_text(
-            "**Qobuz-TG**\n\n"
+            f"**Qobuz-TG** (upload: `{mode}`)\n\n"
             "**Download**\n"
             "`/al_id <id>` `/ar_id <id>` `/tr_id <id>`\n\n"
             "**Qobuz credentials**\n"
-            "`/qobuz` — show current setup\n"
-            "`/qobuz_list` — list tokens (masked)\n"
-            "`/qobuz_add <token>` — add auth token\n"
-            "`/qobuz_del <n>` — remove token #n\n"
-            "`/qobuz_setapp <app_id> <secret>` — set app id+secret\n"
-            "`/qobuz_quality <hi-res-192|hi-res|cd|mp3>`\n"
-            "`/save_config` — save all to MongoDB",
+            "`/qobuz` `/qobuz_list` `/qobuz_add` `/qobuz_del`\n"
+            "`/qobuz_setapp` `/qobuz_quality` `/save_config`\n\n"
+            "2 GB uploads need `USER_SESSION_STRING` (same as Aeon).",
             quote=True,
         )
 
@@ -222,12 +242,14 @@ def main() -> None:
         if not message.from_user or not _allowed(message.from_user.id, cfg):
             return await message.reply_text("Unauthorized.")
         toks = list_tokens(cfg)
+        us = bool((getattr(cfg, "USER_SESSION_STRING", "") or "").strip())
         await message.reply_text(
             f"**Qobuz setup**\n"
             f"app_id: `{getattr(cfg, 'QOBUZ_APP_ID', '')}`\n"
             f"secret: `{mask_token(str(getattr(cfg, 'QOBUZ_SECRET', '')))}`\n"
             f"tokens: **{len(toks)}**\n"
             f"quality: `{getattr(cfg, 'QUALITY', '')}`\n"
+            f"upload: `{'user/2GB' if us else 'bot/50MB'}`\n"
             f"mongo: `{'yes' if getattr(cfg, 'DATABASE_URL', '') else 'no'}`"
         )
 
@@ -289,9 +311,7 @@ def main() -> None:
     async def cmd_save(_, message: Message):
         if not message.from_user or not _allowed(message.from_user.id, cfg):
             return await message.reply_text("Unauthorized.")
-        ok = persist_cfg(cfg) or save_to_mongo(
-            getattr(cfg, "DATABASE_URL", ""), cfg.BOT_TOKEN, {k: getattr(cfg, k) for k in dir(cfg) if k.isupper()}
-        )
+        ok = persist_cfg(cfg)
         await message.reply_text(
             "Saved to MongoDB." if ok else "Failed — set DATABASE_URL."
         )
@@ -318,7 +338,9 @@ def main() -> None:
         await app.start()
         if user_client:
             await user_client.start()
-            log.info("User session started")
+            log.info("User session started (2 GB upload mode)")
+        else:
+            log.info("No USER_SESSION_STRING — bot upload limit ~50 MB (same as Aeon without session)")
         me = await app.get_me()
         log.info("Bot @%s", me.username)
         await idle()
