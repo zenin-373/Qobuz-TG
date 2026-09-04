@@ -1,45 +1,31 @@
 # Qobuz-TG
 
-Telegram bot for Qobuz: download by ID → post album **poster** to your channel → **delete** local files.
+Telegram bot for Qobuz (MLTB-style):
 
-Nothing is kept on the server.
+**download → post cover + caption + music files → delete local files**
 
 ## Commands
 
-Telegram command names cannot contain `-`, so use underscores:
-
-| Command | Meaning |
+| Command | Action |
 |---------|--------|
-| `/al_id <id>` | Download album |
-| `/ar_id <id>` | Download full artist discography |
-| `/tr_id <id>` | Download single track |
+| `/al_id <id>` | Album |
+| `/ar_id <id>` | Artist discography |
+| `/tr_id <id>` | Track |
+| `/save_config` | Save settings to MongoDB |
 
-Examples:
-
-```text
-/al_id 0074643811224
-/ar_id 687008
-/tr_id 23929921
-```
-
-You can also send plain text:
-
-```text
-al-id 0074643811224
-ar-id 687008
-tr-id 23929921
-```
+Plain text also works: `al-id 123`, `ar-id 123`, `tr-id 123`.
 
 ## Pipeline
 
 ```text
-command → Qobuz download (temp)
-       → post cover + caption to channel
-       → delete temp files
-       → done
+/al_id …
+  → qobuz-dl download (temp)
+  → send cover + caption to channel
+  → send each track (audio/document)
+  → delete temp files
 ```
 
-### Poster caption
+Poster caption:
 
 ```text
 📖 Album Title
@@ -50,53 +36,64 @@ command → Qobuz download (temp)
 🏷️ Genre: ...
 ```
 
-## Requirements
+## Config (Aeon-MLTB style)
 
-- Python 3.10+
-- Telegram bot token (@BotFather)
-- Your Telegram user id (owner)
-- Channel id (bot must be admin)
-- Qobuz `app_id`, `secret`, `auth_token`(s)
-- [qobuzdl-collab](https://github.com/zenin-373/qobuzdl-collab) / qobuz-dl installed
+Copy `config_sample.py` → `config.py`:
+
+| Variable | Source |
+|----------|--------|
+| `BOT_TOKEN` | @BotFather |
+| `OWNER_ID` | @userinfobot |
+| `CHANNEL_ID` | your channel (`-100…`), bot = admin |
+| `TELEGRAM_API` | [my.telegram.org](https://my.telegram.org) api_id |
+| `TELEGRAM_HASH` | my.telegram.org api_hash |
+| `USER_SESSION_STRING` | optional — large FLAC uploads |
+| `DATABASE_URL` | MongoDB URI (store credentials) |
+| `QOBUZ_*` | app_id, secret, tokens |
+
+`SEND_TRACKS = True` by default.
+
+### File size
+
+- **Bot only:** ~50 MB per file (`MAX_TG_FILE_MB = 49`)
+- **With `USER_SESSION_STRING`:** larger files via user client (Premium helps)
+
+Hi-Res FLACs often need the user session or lower quality (`cd` / `hi-res`).
+
+## MongoDB
+
+Set `DATABASE_URL`. On start, settings override `config.py` when present in DB.
+
+Send `/save_config` as owner to push current config into MongoDB.
+
+## Update to latest commit
+
+```bash
+python update.py
+```
+
+Pulls `UPSTREAM_REPO` / `UPSTREAM_BRANCH` (keeps local `config.py`).
 
 ## Setup
 
 ```bash
 git clone https://github.com/zenin-373/Qobuz-TG.git
 cd Qobuz-TG
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-# Install Qobuz downloader
 pip install git+https://github.com/zenin-373/qobuzdl-collab.git
 
 cp config_sample.py config.py
-# edit config.py
+# fill BOT_TOKEN, TELEGRAM_API, TELEGRAM_HASH, OWNER_ID, CHANNEL_ID, Qobuz tokens
 
 python -m bot
 ```
 
-## Config (`config.py`)
+Optional auto-update before start:
 
-See `config_sample.py`.
-
-| Key | Description |
-|-----|-------------|
-| `BOT_TOKEN` | From @BotFather |
-| `OWNER_ID` | Your numeric Telegram user id |
-| `CHANNEL_ID` | Channel to post posters (e.g. `-100...`) |
-| `QOBUZ_APP_ID` | Qobuz app id |
-| `QOBUZ_SECRET` | Qobuz secret |
-| `QOBUZ_AUTH_TOKENS` | List of tokens |
-| `TEMP_DIR` | Temp download folder |
-| `QUALITY` | `hi-res-192` / `hi-res` / `cd` |
-
-## Notes
-
-- Local files are **always deleted** after the poster is sent.
-- Full Hi-Res tracks often exceed Telegram’s ~50 MB bot limit; this bot posts the **poster only** by default.
-- Drive upload is **not** included.
+```bash
+python update.py && python -m bot
+```
 
 ## License
 
