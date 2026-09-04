@@ -1,0 +1,8 @@
+build:
+  languages:
+    - python
+
+run:
+  worker:
+    command:
+      - python update.py && python -m bot
