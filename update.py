@@ -1,11 +1,13 @@
-"""Pull latest code from UPSTREAM_REPO (Aeon-MLTB style)."""
+"""Pull latest code from UPSTREAM_REPO (Aeon-MLTB style).
+Run manually: python update.py
+Do NOT run automatically on Heroku boot.
+"""
 
 from __future__ import annotations
 
 import logging
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 logging.basicConfig(
@@ -37,37 +39,14 @@ def _cfg() -> dict:
     }
 
 
-def _maybe_load_upstream_from_mongo(cfg: dict) -> dict:
-    url = cfg.get("DATABASE_URL") or ""
-    token = cfg.get("BOT_TOKEN") or ""
-    if not url or not token:
-        return cfg
-    try:
-        from pymongo import MongoClient
-
-        bot_id = token.split(":", 1)[0]
-        client = MongoClient(url, serverSelectionTimeoutMS=8000)
-        db = client.qobuz_tg
-        doc = db.settings.config.find_one({"_id": bot_id})
-        if doc:
-            cfg["UPSTREAM_REPO"] = doc.get("UPSTREAM_REPO", cfg["UPSTREAM_REPO"])
-            cfg["UPSTREAM_BRANCH"] = doc.get("UPSTREAM_BRANCH", cfg["UPSTREAM_BRANCH"])
-            log.info("Loaded UPSTREAM_* from MongoDB")
-        client.close()
-    except Exception as e:
-        log.error("MongoDB error: %s", e)
-    return cfg
-
-
 def main() -> None:
-    cfg = _maybe_load_upstream_from_mongo(_cfg())
+    cfg = _cfg()
     repo = cfg["UPSTREAM_REPO"]
     branch = cfg["UPSTREAM_BRANCH"]
     if not repo:
-        log.error("UPSTREAM_REPO empty — skip update")
+        log.error("UPSTREAM_REPO empty — skip")
         return
 
-    # Keep local config.py / secrets
     preserve = ["config.py", ".env", "log.txt"]
     backup: dict[str, bytes] = {}
     for name in preserve:
@@ -88,10 +67,9 @@ def main() -> None:
     )
     result = subprocess.run(cmd, shell=True)
     if result.returncode == 0:
-        log.info("Updated to latest commit from %s (%s)", repo, branch)
+        log.info("Updated to latest from %s (%s)", repo, branch)
     else:
-        log.error("Update failed — check UPSTREAM_REPO / branch")
-        sys.exit(1)
+        log.error("Update failed — continuing with existing files")
 
     for name, content in backup.items():
         Path(name).write_bytes(content)
