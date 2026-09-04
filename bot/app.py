@@ -11,7 +11,7 @@ import logging
 import re
 from pathlib import Path
 
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 
 from bot.db import merge_config, save_to_mongo
@@ -55,12 +55,11 @@ def _max_bytes(cfg) -> int:
 
 
 def _list_audio(album_dir: Path) -> list[Path]:
-    files = [
+    return [
         p
         for p in sorted(album_dir.iterdir())
         if p.is_file() and p.suffix.lower() in AUDIO_EXTS
     ]
-    return files
 
 
 async def _send_tracks(
@@ -71,16 +70,13 @@ async def _send_tracks(
     cfg,
     status: Message,
 ) -> tuple[int, int]:
-    """Send audio files. Prefer user_client for large files if set."""
     sent, skipped = 0, 0
     limit = _max_bytes(cfg)
-    uploader = user_client or client
 
     for i, path in enumerate(files, 1):
         size = path.stat().st_size
-        # Bot API ~50MB; user client can go higher if Premium / session set
         use_user = user_client is not None and size > limit
-        sender = user_client if use_user else uploader
+        sender = user_client if use_user else client
         effective_limit = (2 * 1024 * 1024 * 1024) if use_user else limit
 
         if size > effective_limit:
@@ -95,18 +91,9 @@ async def _send_tracks(
 
         try:
             if path.suffix.lower() == ".mp3":
-                await sender.send_audio(
-                    chat_id,
-                    path,
-                    file_name=path.name,
-                )
+                await sender.send_audio(chat_id, path, file_name=path.name)
             else:
-                # FLAC etc. as document keeps full quality filename
-                await sender.send_document(
-                    chat_id,
-                    path,
-                    file_name=path.name,
-                )
+                await sender.send_document(chat_id, path, file_name=path.name)
             sent += 1
             await asyncio.sleep(0.4)
         except Exception as e:
@@ -126,7 +113,6 @@ async def _run_job(client: Client, message: Message, kind: str, id_: str, cfg, u
 
     try:
         await status.edit_text(f"⬇️ Downloading {kind} `{id_}`…")
-        # qobuz-dl is sync/blocking — run in thread
         job_dir, album_dirs = await asyncio.to_thread(run_download, kind, id_, cfg)
 
         if not album_dirs:
@@ -144,11 +130,7 @@ async def _run_job(client: Client, message: Message, kind: str, id_: str, cfg, u
             await status.edit_text(f"📤 Poster: {meta.get('title') or album_dir.name}")
 
             if cover and cover.is_file():
-                await client.send_photo(
-                    channel,
-                    cover,
-                    caption=caption[:1024],
-                )
+                await client.send_photo(channel, cover, caption=caption[:1024])
             else:
                 await client.send_message(channel, caption)
 
@@ -186,13 +168,15 @@ def main() -> None:
     api_id = int(cfg.TELEGRAM_API)
     api_hash = str(cfg.TELEGRAM_HASH)
     bot_token = str(cfg.BOT_TOKEN)
+    sessions = Path(getattr(cfg, "TEMP_DIR", "/tmp/qobuz-tg")) / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
 
     app = Client(
         "qobuz_tg_bot",
         api_id=api_id,
         api_hash=api_hash,
         bot_token=bot_token,
-        workdir=str(Path(getattr(cfg, "TEMP_DIR", "/tmp/qobuz-tg")) / "sessions"),
+        workdir=str(sessions),
     )
 
     user_client = None
@@ -203,7 +187,7 @@ def main() -> None:
             api_id=api_id,
             api_hash=api_hash,
             session_string=session.strip(),
-            workdir=str(Path(getattr(cfg, "TEMP_DIR", "/tmp/qobuz-tg")) / "sessions"),
+            workdir=str(sessions),
         )
 
     @app.on_message(filters.command(["start", "help"]))
@@ -253,9 +237,14 @@ def main() -> None:
             return
         data = {k: getattr(cfg, k) for k in dir(cfg) if k.isupper()}
         ok = save_to_mongo(getattr(cfg, "DATABASE_URL", ""), cfg.BOT_TOKEN, data)
-        await message.reply_text("Saved to MongoDB." if ok else "MongoDB save failed / no DATABASE_URL.")
+        await message.reply_text(
+            "Saved to MongoDB." if ok else "MongoDB save failed / no DATABASE_URL."
+        )
 
-    @app.on_message(filters.text & ~filters.command(["start", "help", "al_id", "ar_id", "tr_id", "save_config"]))
+    @app.on_message(
+        filters.text
+        & ~filters.command(["start", "help", "al_id", "ar_id", "tr_id", "save_config"])
+    )
     async def plain(_, message: Message):
         text = (message.text or "").strip()
         m = PLAIN_RE.match(text)
@@ -271,11 +260,6 @@ def main() -> None:
             user_client,
         )
 
-    Path(getattr(cfg, "TEMP_DIR", "/tmp/qobuz-tg")).mkdir(parents=True, exist_ok=True)
-    (Path(getattr(cfg, "TEMP_DIR", "/tmp/qobuz-tg")) / "sessions").mkdir(
-        parents=True, exist_ok=True
-    )
-
     log.info("Qobuz-TG starting (Pyrogram)…")
 
     async def runner():
@@ -285,7 +269,10 @@ def main() -> None:
             log.info("User session started (large uploads enabled)")
         me = await app.get_me()
         log.info("Bot @%s", me.username)
-        await asyncio.Event().wait()
+        await idle()
+        await app.stop()
+        if user_client:
+            await user_client.stop()
 
     app.run(runner())
 
