@@ -12,12 +12,12 @@ import sys
 from pathlib import Path
 
 try:
-    from wzgram import Client, filters, idle
+    from wzgram import Client, enums, filters, idle
     from wzgram.types import Message
 
     log_lib = "wzgram"
 except ImportError:
-    from pyrogram import Client, filters, idle
+    from pyrogram import Client, enums, filters, idle
     from pyrogram.types import Message
 
     log_lib = "pyrogram"
@@ -91,7 +91,36 @@ def _list_audio(album_dir: Path) -> list[Path]:
     ]
 
 
+def _audio_meta(path: Path) -> tuple[str, str]:
+    """Best-effort title/performer from tags or filename."""
+    title = path.stem
+    performer = ""
+    try:
+        if path.suffix.lower() == ".flac":
+            from mutagen.flac import FLAC
+
+            audio = FLAC(path)
+            if audio.get("title"):
+                title = str(audio["title"][0])
+            if audio.get("artist"):
+                performer = str(audio["artist"][0])
+        elif path.suffix.lower() == ".mp3":
+            from mutagen.mp3 import MP3
+            from mutagen.id3 import TIT2, TPE1
+
+            audio = MP3(path)
+            if audio.tags:
+                if audio.tags.get("TIT2"):
+                    title = str(audio.tags["TIT2"].text[0])
+                if audio.tags.get("TPE1"):
+                    performer = str(audio.tags["TPE1"].text[0])
+    except Exception:
+        pass
+    return title, performer
+
+
 async def _send_tracks(client, user_client, chat_id, files, cfg, status):
+    """Upload as Telegram audio media (not documents)."""
     sent, skipped = 0, 0
     sender = user_client if user_client is not None else client
     for i, path in enumerate(files, 1):
@@ -103,16 +132,25 @@ async def _send_tracks(client, user_client, chat_id, files, cfg, status):
             await status.edit_text(f"🎵 Uploading {i}/{len(files)}: {path.name}")
         except Exception:
             pass
+        title, performer = _audio_meta(path)
         try:
-            if path.suffix.lower() == ".mp3":
-                await sender.send_audio(chat_id, path, file_name=path.name)
-            else:
-                await sender.send_document(chat_id, path, file_name=path.name)
+            await sender.send_audio(
+                chat_id,
+                path,
+                file_name=path.name,
+                title=title,
+                performer=performer or None,
+            )
             sent += 1
             await asyncio.sleep(0.3)
         except Exception as e:
-            log.error("Upload failed %s: %s", path.name, e)
-            skipped += 1
+            log.error("send_audio failed %s: %s — fallback document", path.name, e)
+            try:
+                await sender.send_document(chat_id, path, file_name=path.name)
+                sent += 1
+            except Exception as e2:
+                log.error("Upload failed %s: %s", path.name, e2)
+                skipped += 1
     return sent, skipped
 
 
@@ -141,9 +179,18 @@ async def _run_job(client, message, kind, id_, cfg, user_client):
             cover = find_cover(album_dir)
             await status.edit_text(f"📤 Poster: {meta.get('title') or album_dir.name}")
             if cover and cover.is_file():
-                await client.send_photo(channel, cover, caption=caption[:1024])
+                await client.send_photo(
+                    channel,
+                    cover,
+                    caption=caption[:1024],
+                    parse_mode=enums.ParseMode.HTML,
+                )
             else:
-                await client.send_message(channel, caption)
+                await client.send_message(
+                    channel,
+                    caption,
+                    parse_mode=enums.ParseMode.HTML,
+                )
             posted += 1
             if getattr(cfg, "SEND_TRACKS", True):
                 s, k = await _send_tracks(
@@ -210,7 +257,6 @@ def main() -> None:
 
     @app.on_message(filters.command(["start", "help"]))
     async def cmd_start(_, message: Message):
-        # Always reply so you know the bot is alive
         uid = message.from_user.id if message.from_user else None
         ok = uid is not None and _allowed(uid, cfg)
         text = (
@@ -232,7 +278,7 @@ def main() -> None:
                 "Not authorized to download.\n"
                 "Set Heroku config `OWNER_ID` to your id above, then restart the dyno."
             )
-        await message.reply_text(text, quote=True)
+        await message.reply_text(text)
 
     @app.on_message(filters.command("al_id"))
     async def cmd_al(_, message: Message):
@@ -300,6 +346,8 @@ def main() -> None:
 
     @app.on_message(filters.command("qobuz_setapp"))
     async def cmd_qobuz_setapp(_, message: Message):
+        if not message.from_user or not _allowed(message.from_user.id, cfg):
+            return await message.reply_text("Usage: /qobuz_setapp <app_id> <secret>")
         if not message.from_user or not _allowed(message.from_user.id, cfg):
             return await message.reply_text("Unauthorized.")
         parts = (message.text or "").split()
