@@ -4,4 +4,4 @@ requests>=2.28
 rich>=13.0
 mutagen>=1.46
 click>=8.1
-git+https://github.com/zenin-373/qobuzdl-collab.git
+git+https://github.com/zenin-373/qobuzdl-collab.git@17cc826e3500fef58faa2ac0294fbde989af66a1
