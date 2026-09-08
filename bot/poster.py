@@ -3,8 +3,16 @@
 from __future__ import annotations
 
 import html
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+
+def _clean(s: str) -> str:
+    """Escape HTML and strip any residual tags from metadata."""
+    s = str(s or "")
+    s = re.sub(r"<[^>]+>", "", s)  # drop raw tags from Qobuz metadata
+    return html.escape(s, quote=True)
 
 
 def build_caption(
@@ -15,17 +23,17 @@ def build_caption(
     quality: str = "",
     genre: str = "",
 ) -> str:
-    lines: list[str] = [f"📖 {html.escape(str(title))}"]
+    lines: list[str] = [f"📖 {_clean(title)}"]
     if artist:
-        lines.append(f"🎤 Artist: {html.escape(str(artist))}")
+        lines.append(f"🎤 Artist: {_clean(artist)}")
     if year:
-        lines.append(f"📅 Year: {html.escape(str(year))}")
+        lines.append(f"📅 Year: {_clean(year)}")
     if tracks not in ("", None):
-        lines.append(f"🎵 Tracks: {html.escape(str(tracks))}")
+        lines.append(f"🎵 Tracks: {_clean(tracks)}")
     if quality:
-        lines.append(f"🎧 Quality: {html.escape(str(quality))}")
+        lines.append(f"🎧 Quality: {_clean(quality)}")
     if genre:
-        lines.append(f"🏷️ Genre: {html.escape(str(genre))}")
+        lines.append(f"🏷️ Genre: {_clean(genre)}")
     body = "\n".join(lines)
     return f"<blockquote>{body}</blockquote>"
 
