@@ -1,7 +1,8 @@
-"""Aeon/MLTB-style status & progress messages."""
+"""Aeon/MLTB-style status & progress messages (plain text)."""
 
 from __future__ import annotations
 
+import re
 import shutil
 import time
 from typing import Optional
@@ -65,9 +66,16 @@ def system_footer() -> str:
     return f"CPU: {cpu} | FREE: {free}\nRAM: {ram} | UPTIME: {up}"
 
 
+def _plain(s: object) -> str:
+    """Strip any HTML-like tags from metadata/filenames."""
+    t = str(s or "")
+    t = re.sub(r"<[^>]*>", "", t)
+    return t.replace("\n", " ").strip()
+
+
 def progress_message(
     *,
-    action: str,  # Download / Upload
+    action: str,
     name: str,
     user_id: int | str,
     processed: int = 0,
@@ -77,7 +85,6 @@ def progress_message(
     tool: str = "telegram",
     extra: str = "",
 ) -> str:
-    """Build progress card matching mirror-bot style."""
     if total > 0:
         pct = processed * 100.0 / total
         eta = (total - processed) / speed if speed > 0 else None
@@ -86,8 +93,8 @@ def progress_message(
         eta = None
 
     lines = [
-        f"<b>{action}:</b> { _escape(name) }",
-        f"by: <code>{user_id}</code>",
+        f"{action}: {_plain(name)}",
+        f"by: {user_id}",
         f"{_bar(pct)} {pct:.1f}%",
         f"Processed: {human_bytes(processed)}",
         f"Size: {human_bytes(total) if total else '-'}",
@@ -98,52 +105,43 @@ def progress_message(
     if job_id:
         lines.append(f"/stop_{job_id}")
     if extra:
-        lines.append(extra)
+        lines.append(_plain(extra))
     lines.append("")
     lines.append(system_footer())
     return "\n".join(lines)
 
 
-def _escape(s: str) -> str:
-    return (
-        str(s)
-        .replace("&", "&")
-        .replace("<", "<")
-        .replace(">", ">")
-    )
-
-
 def info_card(kind: str, data: dict) -> str:
-    """Pre-download info panel."""
+    """Pre-download info panel (plain text)."""
     if kind == "album":
         lines = [
-            "<b>📀 Album info</b>",
-            f"📖 <b>{_escape(data.get('title', ''))}</b>",
-            f"🎤 Artist: {_escape(data.get('artist', ''))}",
-            f"📅 Year: {_escape(data.get('year', ''))}",
+            "📀 Album info",
+            f"📖 {_plain(data.get('title', ''))}",
+            f"🎤 Artist: {_plain(data.get('artist', ''))}",
+            f"📅 Year: {_plain(data.get('year', ''))}",
             f"🎵 Tracks: {data.get('tracks', '?')}",
-            f"🎧 Quality: {_escape(data.get('quality', ''))}",
-            f"🏷️ Genre: {_escape(data.get('genre', ''))}",
-            f"⏱ Duration: {_escape(data.get('duration', ''))}",
-            f"🆔 <code>{_escape(data.get('id', ''))}</code>",
+            f"🎧 Quality: {_plain(data.get('quality', ''))}",
+            f"🏷️ Genre: {_plain(data.get('genre', ''))}",
+            f"⏱ Duration: {_plain(data.get('duration', ''))}",
+            f"🆔 { _plain(data.get('id', '')) }",
         ]
     elif kind == "track":
         lines = [
-            "<b>🎵 Track info</b>",
-            f"📖 <b>{_escape(data.get('title', ''))}</b>",
-            f"🎤 Artist: {_escape(data.get('artist', ''))}",
-            f"💿 Album: {_escape(data.get('album', ''))}",
-            f"📅 Year: {_escape(data.get('year', ''))}",
-            f"🎧 Quality: {_escape(data.get('quality', ''))}",
-            f"⏱ Duration: {_escape(data.get('duration', ''))}",
-            f"🆔 <code>{_escape(data.get('id', ''))}</code>",
+            "🎵 Track info",
+            f"📖 {_plain(data.get('title', ''))}",
+            f"🎤 Artist: {_plain(data.get('artist', ''))}",
+            f"💿 Album: {_plain(data.get('album', ''))}",
+            f"📅 Year: {_plain(data.get('year', ''))}",
+            f"🎧 Quality: {_plain(data.get('quality', ''))}",
+            f"⏱ Duration: {_plain(data.get('duration', ''))}",
+            f"🆔 {_plain(data.get('id', ''))}",
         ]
-    else:  # artist
+    else:
         lines = [
-            "<b>🎤 Artist info</b>",
-            f"👤 <b>{_escape(data.get('name', ''))}</b>",
-            f"📀 Albums / releases: <b>{data.get('albums', '?')}</b>",
-            f"🎵 Tracks (approx): <b>{data.get('tracks', '?')}</b>",
-            f"🆔 <code>{_escape(data.get('id', ''))}</code>",
+            "🎤 Artist info",
+            f"👤 {_plain(data.get('name', ''))}",
+            f"📀 Albums / releases: {data.get('albums', '?')}",
+            f"🎵 Tracks (approx): {data.get('tracks', '?')}",
+            f"🆔 {_plain(data.get('id', ''))}",
         ]
     return "\n".join(lines)
