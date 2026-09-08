@@ -26,8 +26,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("update")
 
-# Never overwrite secrets / runtime state
-PRESERVE = {"config.py", ".env", "log.txt", "update.py"}
+# Never overwrite secrets / runtime state (NOT update.py — it must self-update)
+PRESERVE = {"config.py", ".env", "log.txt"}
 SKIP_PREFIXES = (".git/", "sessions/", "__pycache__/")
 
 
@@ -58,13 +58,11 @@ def _has_git() -> bool:
 
 
 def _github_zip_url(repo: str, branch: str) -> str:
-    """https://github.com/owner/repo → archive zip URL."""
     repo = repo.rstrip("/")
     if repo.endswith(".git"):
         repo = repo[:-4]
-    # already a github URL
     if "github.com" in repo:
-        path = urlparse(repo).path.strip("/")  # owner/repo
+        path = urlparse(repo).path.strip("/")
         return f"https://github.com/{path}/archive/refs/heads/{branch}.zip"
     return f"https://github.com/{repo}/archive/refs/heads/{branch}.zip"
 
@@ -93,7 +91,6 @@ def _update_via_zip(repo: str, branch: str) -> bool:
 
     root = Path(".").resolve()
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        # GitHub zip top folder: Repo-branch/
         names = zf.namelist()
         if not names:
             return False
@@ -110,10 +107,10 @@ def _update_via_zip(repo: str, branch: str) -> bool:
                 continue
             if any(rel.startswith(p) for p in SKIP_PREFIXES):
                 continue
-            # only update project files
             if not (
                 rel.startswith("bot/")
-                or rel in {
+                or rel
+                in {
                     "Procfile",
                     "requirements.txt",
                     "runtime.txt",
@@ -123,10 +120,9 @@ def _update_via_zip(repo: str, branch: str) -> bool:
                     "README.md",
                 }
                 or rel.startswith(".github/")
+                or (rel.endswith(".py") and "/" not in rel)
             ):
-                # still allow any .py at root
-                if not rel.endswith(".py") and "/" not in rel.rstrip("/"):
-                    continue
+                continue
 
             target = root / rel
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -143,7 +139,6 @@ def main() -> None:
         log.warning("UPSTREAM_REPO empty — skip update")
         return
 
-    # Backup secrets
     backup: dict[str, bytes] = {}
     for name in PRESERVE:
         p = Path(name)
