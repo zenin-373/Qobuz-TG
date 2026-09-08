@@ -13,11 +13,13 @@ from pathlib import Path
 
 try:
     from wzgram import Client, enums, filters, idle
+    from wzgram.errors import FloodWait
     from wzgram.types import Message
 
     log_lib = "wzgram"
 except ImportError:
     from pyrogram import Client, enums, filters, idle
+    from pyrogram.errors import FloodWait
     from pyrogram.types import Message
 
     log_lib = "pyrogram"
@@ -48,6 +50,8 @@ PLAIN_RE = re.compile(
 )
 AUDIO_EXTS = {".flac", ".mp3", ".m4a", ".wav", ".ogg"}
 UPLOAD_LIMIT = 2 * 1024 * 1024 * 1024
+# Pause between media sends to reduce Telegram flood waits
+UPLOAD_PAUSE = 1.5
 
 CMD_BLOCK = [
     "start",
@@ -92,7 +96,6 @@ def _list_audio(album_dir: Path) -> list[Path]:
 
 
 def _audio_meta(path: Path) -> tuple[str, str]:
-    """Best-effort title/performer from tags or filename."""
     title = path.stem
     performer = ""
     try:
@@ -106,7 +109,6 @@ def _audio_meta(path: Path) -> tuple[str, str]:
                 performer = str(audio["artist"][0])
         elif path.suffix.lower() == ".mp3":
             from mutagen.mp3 import MP3
-            from mutagen.id3 import TIT2, TPE1
 
             audio = MP3(path)
             if audio.tags:
@@ -119,8 +121,18 @@ def _audio_meta(path: Path) -> tuple[str, str]:
     return title, performer
 
 
+async def _send_with_flood(coro_factory):
+    """Run an async send; sleep and retry on FloodWait."""
+    while True:
+        try:
+            return await coro_factory()
+        except FloodWait as e:
+            wait = int(getattr(e, "value", None) or getattr(e, "x", 30))
+            log.warning("FloodWait %ss — sleeping", wait)
+            await asyncio.sleep(wait + 1)
+
+
 async def _send_tracks(client, user_client, chat_id, files, cfg, status):
-    """Upload as Telegram audio media (not documents)."""
     sent, skipped = 0, 0
     sender = user_client if user_client is not None else client
     for i, path in enumerate(files, 1):
@@ -129,25 +141,33 @@ async def _send_tracks(client, user_client, chat_id, files, cfg, status):
             skipped += 1
             continue
         try:
-            await status.edit_text(f"🎵 Uploading {i}/{len(files)}: {path.name}")
+            await status.edit_text(
+                f"Uploading {i}/{len(files)}: {path.name}",
+                parse_mode=None,
+            )
         except Exception:
             pass
         title, performer = _audio_meta(path)
-        try:
-            await sender.send_audio(
-                chat_id,
-                path,
-                file_name=path.name,
-                title=title,
-                performer=performer or None,
+
+        async def do_audio(p=path, t=title, pr=performer):
+            return await sender.send_audio(
+                chat_id, p, file_name=p.name, title=t, performer=pr or None
             )
+
+        try:
+            await _send_with_flood(do_audio)
             sent += 1
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(UPLOAD_PAUSE)
         except Exception as e:
             log.error("send_audio failed %s: %s — fallback document", path.name, e)
+
+            async def do_doc(p=path):
+                return await sender.send_document(chat_id, p, file_name=p.name)
+
             try:
-                await sender.send_document(chat_id, path, file_name=path.name)
+                await _send_with_flood(do_doc)
                 sent += 1
+                await asyncio.sleep(UPLOAD_PAUSE)
             except Exception as e2:
                 log.error("Upload failed %s: %s", path.name, e2)
                 skipped += 1
@@ -165,10 +185,10 @@ async def _run_job(client, message, kind, id_, cfg, user_client):
     status = await message.reply_text(f"⏳ {kind} `{id_}` — starting…")
     job_dir = None
     try:
-        await status.edit_text(f"⬇️ Downloading {kind} `{id_}`…")
+        await status.edit_text(f"⬇️ Downloading {kind} `{id_}`…", parse_mode=None)
         job_dir, album_dirs = await asyncio.to_thread(run_download, kind, id_, cfg)
         if not album_dirs:
-            await status.edit_text("Download finished but no album folder found.")
+            await status.edit_text("Download finished but no album folder found.", parse_mode=None)
             return
 
         channel = int(cfg.CHANNEL_ID)
@@ -177,21 +197,27 @@ async def _run_job(client, message, kind, id_, cfg, user_client):
             meta = meta_from_folder(album_dir)
             caption = caption_from_album_meta(meta)
             cover = find_cover(album_dir)
-            await status.edit_text(f"📤 Poster: {meta.get('title') or album_dir.name}")
-            if cover and cover.is_file():
-                await client.send_photo(
-                    channel,
-                    cover,
-                    caption=caption[:1024],
-                    parse_mode=enums.ParseMode.HTML,
+            await status.edit_text(
+                f"📤 Poster: {meta.get('title') or album_dir.name}",
+                parse_mode=None,
+            )
+
+            async def send_poster(c=cover, cap=caption):
+                if c and c.is_file():
+                    return await client.send_photo(
+                        channel,
+                        c,
+                        caption=cap[:1024],
+                        parse_mode=enums.ParseMode.HTML,
+                    )
+                return await client.send_message(
+                    channel, cap, parse_mode=enums.ParseMode.HTML
                 )
-            else:
-                await client.send_message(
-                    channel,
-                    caption,
-                    parse_mode=enums.ParseMode.HTML,
-                )
+
+            await _send_with_flood(send_poster)
             posted += 1
+            await asyncio.sleep(UPLOAD_PAUSE)
+
             if getattr(cfg, "SEND_TRACKS", True):
                 s, k = await _send_tracks(
                     client, user_client, channel, _list_audio(album_dir), cfg, status
@@ -201,12 +227,13 @@ async def _run_job(client, message, kind, id_, cfg, user_client):
 
         await status.edit_text(
             f"✅ Done\nPosters: {posted}\nTracks sent: {total_sent}\n"
-            f"Skipped: {total_skip}\nLocal files deleted."
+            f"Skipped: {total_skip}\nLocal files deleted.",
+            parse_mode=None,
         )
     except Exception as exc:
         log.exception("job failed")
         try:
-            await status.edit_text(f"❌ Error:\n{exc}")
+            await status.edit_text(f"❌ Error:\n{exc}", parse_mode=None)
         except Exception:
             await message.reply_text(f"❌ Error:\n{exc}")
     finally:
@@ -346,8 +373,6 @@ def main() -> None:
 
     @app.on_message(filters.command("qobuz_setapp"))
     async def cmd_qobuz_setapp(_, message: Message):
-        if not message.from_user or not _allowed(message.from_user.id, cfg):
-            return await message.reply_text("Usage: /qobuz_setapp <app_id> <secret>")
         if not message.from_user or not _allowed(message.from_user.id, cfg):
             return await message.reply_text("Unauthorized.")
         parts = (message.text or "").split()
