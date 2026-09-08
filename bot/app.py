@@ -1,7 +1,4 @@
-"""Qobuz-TG: download → poster + music → delete.
-
-Uses wzgram (Pyrogram fork) over MTProto — ~2 GB with bot token only.
-"""
+"""Qobuz-TG: info → download → progress upload → delete."""
 
 from __future__ import annotations
 
@@ -9,7 +6,10 @@ import asyncio
 import logging
 import re
 import sys
+import time
+import uuid
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 try:
     from wzgram import Client, enums, filters, idle
@@ -35,6 +35,8 @@ from bot.db import (
 )
 from bot.env_config import load_config
 from bot.poster import caption_from_album_meta, find_cover
+from bot.progress import info_card, progress_message
+from bot.qobuz_info import fetch_info
 from bot.qobuz_worker import cleanup, meta_from_folder, run_download
 
 logging.basicConfig(
@@ -48,10 +50,13 @@ PLAIN_RE = re.compile(
     r"^(?P<kind>al|ar|tr)[-_]?id\s+(?P<id>[A-Za-z0-9]+)\s*$",
     re.I,
 )
+STOP_RE = re.compile(r"^/stop_([a-f0-9]{6,12})$", re.I)
 AUDIO_EXTS = {".flac", ".mp3", ".m4a", ".wav", ".ogg"}
 UPLOAD_LIMIT = 2 * 1024 * 1024 * 1024
-# Pause between media sends to reduce Telegram flood waits
 UPLOAD_PAUSE = 1.5
+
+# job_id -> {"cancel": bool, "user": int}
+JOBS: Dict[str, Dict[str, Any]] = {}
 
 CMD_BLOCK = [
     "start",
@@ -78,8 +83,7 @@ def _allowed(user_id: int, cfg) -> bool:
         owners = {int(cfg.OWNER_ID)}
     except (TypeError, ValueError):
         owners = set()
-    extra = getattr(cfg, "AUTHORIZED_IDS", []) or []
-    for x in extra:
+    for x in getattr(cfg, "AUTHORIZED_IDS", []) or []:
         try:
             owners.add(int(x))
         except (TypeError, ValueError):
@@ -122,31 +126,59 @@ def _audio_meta(path: Path) -> tuple[str, str]:
 
 
 async def _send_with_flood(coro_factory):
-    """Run an async send; sleep and retry on FloodWait."""
     while True:
         try:
             return await coro_factory()
         except FloodWait as e:
             wait = int(getattr(e, "value", None) or getattr(e, "x", 30))
-            log.warning("FloodWait %ss — sleeping", wait)
+            log.warning("FloodWait %ss", wait)
             await asyncio.sleep(wait + 1)
 
 
-async def _send_tracks(client, user_client, chat_id, files, cfg, status):
+async def _edit(status, text: str, html: bool = True):
+    try:
+        await status.edit_text(
+            text,
+            parse_mode=enums.ParseMode.HTML if html else None,
+        )
+    except Exception:
+        pass
+
+
+async def _send_tracks(client, user_client, chat_id, files, cfg, status, user_id, job_id):
     sent, skipped = 0, 0
     sender = user_client if user_client is not None else client
+    total_files = len(files)
+    total_bytes = sum(p.stat().st_size for p in files)
+    done_bytes = 0
+    t0 = time.time()
+
     for i, path in enumerate(files, 1):
+        if JOBS.get(job_id, {}).get("cancel"):
+            await _edit(status, f"⏹ Stopped by user\n/job <code>{job_id}</code>")
+            break
         size = path.stat().st_size
         if size > UPLOAD_LIMIT:
             skipped += 1
             continue
-        try:
-            await status.edit_text(
-                f"Uploading {i}/{len(files)}: {path.name}",
-                parse_mode=None,
-            )
-        except Exception:
-            pass
+
+        elapsed = max(time.time() - t0, 0.001)
+        speed = done_bytes / elapsed
+        await _edit(
+            status,
+            progress_message(
+                action="Upload",
+                name=path.name,
+                user_id=user_id,
+                processed=done_bytes,
+                total=total_bytes or size,
+                speed=speed,
+                job_id=job_id,
+                tool="telegram",
+                extra=f"File {i}/{total_files}",
+            ),
+        )
+
         title, performer = _audio_meta(path)
 
         async def do_audio(p=path, t=title, pr=performer):
@@ -157,9 +189,10 @@ async def _send_tracks(client, user_client, chat_id, files, cfg, status):
         try:
             await _send_with_flood(do_audio)
             sent += 1
+            done_bytes += size
             await asyncio.sleep(UPLOAD_PAUSE)
         except Exception as e:
-            log.error("send_audio failed %s: %s — fallback document", path.name, e)
+            log.error("send_audio %s: %s", path.name, e)
 
             async def do_doc(p=path):
                 return await sender.send_document(chat_id, p, file_name=p.name)
@@ -167,10 +200,12 @@ async def _send_tracks(client, user_client, chat_id, files, cfg, status):
             try:
                 await _send_with_flood(do_doc)
                 sent += 1
+                done_bytes += size
                 await asyncio.sleep(UPLOAD_PAUSE)
             except Exception as e2:
                 log.error("Upload failed %s: %s", path.name, e2)
                 skipped += 1
+
     return sent, skipped
 
 
@@ -182,24 +217,84 @@ async def _run_job(client, message, kind, id_, cfg, user_client):
         )
         return
 
-    status = await message.reply_text(f"⏳ {kind} `{id_}` — starting…")
+    user_id = message.from_user.id
+    job_id = uuid.uuid4().hex[:8]
+    JOBS[job_id] = {"cancel": False, "user": user_id}
+
+    status = await message.reply_text(
+        f"⏳ Fetching {kind} info…\n<code>{id_}</code>\n/stop_{job_id}",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
     job_dir = None
     try:
-        await status.edit_text(f"⬇️ Downloading {kind} `{id_}`…", parse_mode=None)
-        job_dir, album_dirs = await asyncio.to_thread(run_download, kind, id_, cfg)
-        if not album_dirs:
-            await status.edit_text("Download finished but no album folder found.", parse_mode=None)
+        # ── 1) Info card ──────────────────────────────────────────────
+        try:
+            info = await asyncio.to_thread(fetch_info, kind, id_, cfg)
+            card = info_card(kind, info)
+            card += f"\n\n/stop_{job_id}"
+            await _edit(status, card)
+            await asyncio.sleep(1.2)
+        except Exception as e:
+            log.warning("info fetch failed: %s", e)
+            await _edit(
+                status,
+                f"⚠️ Could not fetch info ({e})\nContinuing download…\n/stop_{job_id}",
+            )
+
+        if JOBS[job_id]["cancel"]:
+            await _edit(status, f"⏹ Cancelled before download\n/stop_{job_id}")
             return
 
+        # ── 2) Download ───────────────────────────────────────────────
+        await _edit(
+            status,
+            progress_message(
+                action="Download",
+                name=f"{kind} {id_}",
+                user_id=user_id,
+                processed=0,
+                total=0,
+                speed=0,
+                job_id=job_id,
+                tool="qobuz",
+                extra="Fetching from Qobuz…",
+            ),
+        )
+        job_dir, album_dirs = await asyncio.to_thread(run_download, kind, id_, cfg)
+
+        if JOBS[job_id]["cancel"]:
+            await _edit(status, f"⏹ Cancelled after download\n/stop_{job_id}")
+            return
+
+        if not album_dirs:
+            await _edit(status, "Download finished but no album folder found.")
+            return
+
+        # ── 3) Post + upload ──────────────────────────────────────────
         channel = int(cfg.CHANNEL_ID)
         total_sent = total_skip = posted = 0
+
         for album_dir in album_dirs:
+            if JOBS[job_id]["cancel"]:
+                break
             meta = meta_from_folder(album_dir)
             caption = caption_from_album_meta(meta)
             cover = find_cover(album_dir)
-            await status.edit_text(
-                f"📤 Poster: {meta.get('title') or album_dir.name}",
-                parse_mode=None,
+
+            await _edit(
+                status,
+                progress_message(
+                    action="Upload",
+                    name=str(meta.get("title") or album_dir.name),
+                    user_id=user_id,
+                    processed=0,
+                    total=0,
+                    speed=0,
+                    job_id=job_id,
+                    tool="telegram",
+                    extra="Sending poster…",
+                ),
             )
 
             async def send_poster(c=cover, cap=caption):
@@ -220,23 +315,37 @@ async def _run_job(client, message, kind, id_, cfg, user_client):
 
             if getattr(cfg, "SEND_TRACKS", True):
                 s, k = await _send_tracks(
-                    client, user_client, channel, _list_audio(album_dir), cfg, status
+                    client,
+                    user_client,
+                    channel,
+                    _list_audio(album_dir),
+                    cfg,
+                    status,
+                    user_id,
+                    job_id,
                 )
                 total_sent += s
                 total_skip += k
 
-        await status.edit_text(
-            f"✅ Done\nPosters: {posted}\nTracks sent: {total_sent}\n"
-            f"Skipped: {total_skip}\nLocal files deleted.",
-            parse_mode=None,
+        done = (
+            f"✅ <b>Done</b>\n"
+            f"Posters: {posted}\n"
+            f"Tracks sent: {total_sent}\n"
+            f"Skipped: {total_skip}\n"
+            f"Local files deleted.\n"
+            f"Job: <code>{job_id}</code>"
         )
+        if JOBS.get(job_id, {}).get("cancel"):
+            done = f"⏹ <b>Stopped</b>\n" + done
+        await _edit(status, done)
     except Exception as exc:
         log.exception("job failed")
         try:
-            await status.edit_text(f"❌ Error:\n{exc}", parse_mode=None)
+            await _edit(status, f"❌ Error:\n<code>{exc}</code>")
         except Exception:
             await message.reply_text(f"❌ Error:\n{exc}")
     finally:
+        JOBS.pop(job_id, None)
         if job_dir and getattr(cfg, "DELETE_AFTER_POST", True):
             cleanup(job_dir)
 
@@ -289,23 +398,30 @@ def main() -> None:
         text = (
             f"**Qobuz-TG online** ({log_lib})\n"
             f"Your id: `{uid}`\n"
-            f"Authorized: **{'yes' if ok else 'no'}**\n"
-            f"OWNER_ID config: `{getattr(cfg, 'OWNER_ID', '')}`\n\n"
+            f"Authorized: **{'yes' if ok else 'no'}**\n\n"
         )
         if ok:
             text += (
-                "**Download**\n"
-                "`/al_id <id>` `/ar_id <id>` `/tr_id <id>`\n\n"
-                "**Qobuz**\n"
-                "`/qobuz` `/qobuz_add` `/qobuz_del` `/qobuz_list`\n"
-                "`/qobuz_setapp` `/qobuz_quality` `/save_config`"
-            )
-        else:
-            text += (
-                "Not authorized to download.\n"
-                "Set Heroku config `OWNER_ID` to your id above, then restart the dyno."
+                "`/al_id` `/ar_id` `/tr_id`\n"
+                "Shows full info, then downloads with progress.\n"
+                "Cancel: `/stop_<jobid>`\n\n"
+                "`/qobuz` `/qobuz_add` `/qobuz_list` …"
             )
         await message.reply_text(text)
+
+    @app.on_message(filters.regex(STOP_RE))
+    async def cmd_stop(_, message: Message):
+        if not message.from_user or not _allowed(message.from_user.id, cfg):
+            return
+        m = STOP_RE.match((message.text or "").strip())
+        if not m:
+            return
+        jid = m.group(1).lower()
+        if jid in JOBS:
+            JOBS[jid]["cancel"] = True
+            await message.reply_text(f"⏹ Stop requested for `{jid}`")
+        else:
+            await message.reply_text(f"No active job `{jid}`")
 
     @app.on_message(filters.command("al_id"))
     async def cmd_al(_, message: Message):
