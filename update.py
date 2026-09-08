@@ -1,6 +1,7 @@
-"""Pull latest code from UPSTREAM_REPO (Aeon-MLTB style).
-Run manually: python update.py
-Do NOT run automatically on Heroku boot.
+"""Pull latest code from UPSTREAM_REPO on dyno start (Aeon-MLTB style).
+
+Procfile runs:  python update.py; python -m bot
+If git pull fails, the bot still starts with the last slug files.
 """
 
 from __future__ import annotations
@@ -8,11 +9,13 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s - %(message)s",
+    stream=sys.stdout,
 )
 log = logging.getLogger("update")
 
@@ -26,27 +29,28 @@ def _cfg() -> dict:
             if k.isupper():
                 data[k] = v.strip() if isinstance(v, str) else v
     except Exception:
-        log.info("config.py missing — using environment variables")
+        pass
 
     def env(key: str, default=""):
         return data.get(key) or os.getenv(key, default)
 
     return {
-        "BOT_TOKEN": env("BOT_TOKEN"),
-        "DATABASE_URL": env("DATABASE_URL", ""),
-        "UPSTREAM_REPO": env("UPSTREAM_REPO", "https://github.com/zenin-373/Qobuz-TG"),
+        "UPSTREAM_REPO": env(
+            "UPSTREAM_REPO", "https://github.com/zenin-373/Qobuz-TG"
+        ),
         "UPSTREAM_BRANCH": env("UPSTREAM_BRANCH", "main"),
     }
 
 
 def main() -> None:
     cfg = _cfg()
-    repo = cfg["UPSTREAM_REPO"]
-    branch = cfg["UPSTREAM_BRANCH"]
+    repo = (cfg.get("UPSTREAM_REPO") or "").strip()
+    branch = (cfg.get("UPSTREAM_BRANCH") or "main").strip()
     if not repo:
-        log.error("UPSTREAM_REPO empty — skip")
+        log.warning("UPSTREAM_REPO empty — skip update")
         return
 
+    # Keep local secrets if present on disk
     preserve = ["config.py", ".env", "log.txt"]
     backup: dict[str, bytes] = {}
     for name in preserve:
@@ -54,22 +58,25 @@ def main() -> None:
         if p.is_file():
             backup[name] = p.read_bytes()
 
-    if Path(".git").exists():
-        subprocess.run(["rm", "-rf", ".git"], check=False)
+    try:
+        if Path(".git").exists():
+            subprocess.run(["rm", "-rf", ".git"], check=False)
 
-    cmd = (
-        f"git init -q && "
-        f'git config user.email "qobuz-tg@local" && '
-        f'git config user.name "qobuz-tg" && '
-        f"git remote add origin {repo} && "
-        f"git fetch origin -q && "
-        f"git checkout -f -B {branch} origin/{branch} -q"
-    )
-    result = subprocess.run(cmd, shell=True)
-    if result.returncode == 0:
-        log.info("Updated to latest from %s (%s)", repo, branch)
-    else:
-        log.error("Update failed — continuing with existing files")
+        cmd = (
+            "git init -q && "
+            'git config user.email "qobuz-tg@local" && '
+            'git config user.name "qobuz-tg" && '
+            f"git remote add origin {repo} && "
+            f"git fetch --depth=1 origin {branch} -q && "
+            f"git checkout -f -B {branch} FETCH_HEAD -q"
+        )
+        result = subprocess.run(cmd, shell=True, timeout=120)
+        if result.returncode == 0:
+            log.info("Updated to latest commit from %s (%s)", repo, branch)
+        else:
+            log.error("git update failed (code %s) — bot will use slug files", result.returncode)
+    except Exception as e:
+        log.error("Update error: %s — bot will use slug files", e)
 
     for name, content in backup.items():
         Path(name).write_bytes(content)
