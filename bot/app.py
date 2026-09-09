@@ -207,13 +207,8 @@ async def _run_job(client, message, kind, id_, cfg, user_client):
     job_id = uuid.uuid4().hex[:8]
     JOBS[job_id] = {"cancel": False, "user": user_id}
 
-    # Message 1: info (stays). Message 2: progress (edited).
-    info_msg = await message.reply_text(
-        f"⏳ Fetching {kind} info…\n{id_}",
-    )
-    status = await message.reply_text(
-        f"⏳ Preparing…\n/stop_{job_id}",
-    )
+    info_msg = await message.reply_text(f"⏳ Fetching {kind} info…\n{id_}")
+    status = await message.reply_text(f"⏳ Preparing…\n/stop_{job_id}")
 
     job_dir = None
     try:
@@ -222,10 +217,7 @@ async def _run_job(client, message, kind, id_, cfg, user_client):
             await _edit(info_msg, info_card(kind, info))
         except Exception as e:
             log.warning("info fetch failed: %s", e)
-            await _edit(
-                info_msg,
-                f"⚠️ Could not fetch info ({e})\nContinuing download…",
-            )
+            await _edit(info_msg, f"⚠️ Could not fetch info ({e})\nContinuing download…")
 
         if JOBS[job_id]["cancel"]:
             await _edit(status, f"⏹ Cancelled before download\n/stop_{job_id}")
@@ -245,7 +237,45 @@ async def _run_job(client, message, kind, id_, cfg, user_client):
                 extra="Fetching from Qobuz…",
             ),
         )
-        job_dir, album_dirs = await asyncio.to_thread(run_download, kind, id_, cfg)
+
+        loop = asyncio.get_running_loop()
+        last_edit = [0.0]
+
+        def on_progress(cur: int, total: int, label: str) -> None:
+            import time as _t
+            from bot.progress import _bar, system_footer, _plain
+
+            now = _t.time()
+            if now - last_edit[0] < 1.2 and cur not in (0, total) and total > 0:
+                return
+            last_edit[0] = now
+            total_n = max(int(total or 0), 0)
+            cur_n = int(cur or 0)
+            pct = (cur_n * 100.0 / total_n) if total_n else 0.0
+            lines = [
+                f"Download: {_plain(label)[:90] if label else kind + ' ' + id_}",
+                f"by: {user_id}",
+                f"{_bar(pct)} {pct:.1f}%",
+                f"Albums: {cur_n}/{total_n or '?'}",
+                f"Tool: qobuz",
+                f"/stop_{job_id}",
+                "",
+                system_footer(),
+            ]
+            fut = asyncio.run_coroutine_threadsafe(
+                _edit(status, "\n".join(lines)), loop
+            )
+            try:
+                fut.result(timeout=10)
+            except Exception:
+                pass
+
+        def should_cancel() -> bool:
+            return bool(JOBS.get(job_id, {}).get("cancel"))
+
+        job_dir, album_dirs = await asyncio.to_thread(
+            run_download, kind, id_, cfg, on_progress, should_cancel
+        )
 
         if JOBS[job_id]["cancel"]:
             await _edit(status, f"⏹ Cancelled after download\n/stop_{job_id}")
@@ -286,13 +316,11 @@ async def _run_job(client, message, kind, id_, cfg, user_client):
                 if c and c.is_file():
                     try:
                         return await client.send_photo(
-                            channel,
-                            c,
-                            caption=cap[:1024],
+                            channel, c, caption=cap[:1024],
                             parse_mode=enums.ParseMode.HTML,
                         )
                     except Exception as pe:
-                        log.warning("send_photo failed (%s) — text caption only", pe)
+                        log.warning("send_photo failed (%s) — text only", pe)
                 return await client.send_message(
                     channel, cap, parse_mode=enums.ParseMode.HTML
                 )
@@ -348,11 +376,7 @@ def main() -> None:
     sessions = Path(getattr(cfg, "TEMP_DIR", "/tmp/qobuz-tg")) / "sessions"
     sessions.mkdir(parents=True, exist_ok=True)
 
-    log.info(
-        "OWNER_ID=%s CHANNEL_ID=%s",
-        getattr(cfg, "OWNER_ID", None),
-        getattr(cfg, "CHANNEL_ID", None),
-    )
+    log.info("OWNER_ID=%s CHANNEL_ID=%s", getattr(cfg, "OWNER_ID", None), getattr(cfg, "CHANNEL_ID", None))
 
     app = Client(
         "qobuz_tg_bot",
@@ -385,8 +409,7 @@ def main() -> None:
         if ok:
             text += (
                 "`/al_id` `/ar_id` `/tr_id`\n"
-                "Shows full info, then downloads with progress.\n"
-                "Cancel: `/stop_<jobid>`\n\n"
+                "Cancel: `/stop_<jobid>`\n"
                 "`/qobuz` `/qobuz_add` `/qobuz_list` …"
             )
         await message.reply_text(text)
@@ -432,11 +455,9 @@ def main() -> None:
             return await message.reply_text("Unauthorized.")
         toks = list_tokens(cfg)
         await message.reply_text(
-            f"**Qobuz setup**\n"
-            f"app_id: `{getattr(cfg, 'QOBUZ_APP_ID', '')}`\n"
+            f"**Qobuz setup**\napp_id: `{getattr(cfg, 'QOBUZ_APP_ID', '')}`\n"
             f"secret: `{mask_token(str(getattr(cfg, 'QOBUZ_SECRET', '')))}`\n"
-            f"tokens: **{len(toks)}**\n"
-            f"quality: `{getattr(cfg, 'QUALITY', '')}`"
+            f"tokens: **{len(toks)}**\nquality: `{getattr(cfg, 'QUALITY', '')}`"
         )
 
     @app.on_message(filters.command("qobuz_list"))
