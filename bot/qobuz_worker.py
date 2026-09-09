@@ -1,24 +1,25 @@
-"""Download via qobuz-dl CLI, collect album folders, wipe temp."""
+"""Download via qobuz-dl CLI, with per-album progress for artists."""
 
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+log = logging.getLogger("qobuz-tg.worker")
+
+ProgressCb = Optional[Callable[..., None]]
+CancelCb = Optional[Callable[[], bool]]
 
 
 def _write_qobuz_config(cfg: Any, work_dir: Path) -> Path:
-    """Write a one-shot config for qobuz-dl under ~/.config is global;
-    we set env by writing the standard config path the CLI uses.
-    """
-    # qobuz-dl reads ~/.config/qobuz-dl/config.json — write there for the job.
     cfg_dir = Path.home() / ".config" / "qobuz-dl"
     cfg_dir.mkdir(parents=True, exist_ok=True)
     path = cfg_dir / "config.json"
-
     data = {
         "app_id": str(cfg.QOBUZ_APP_ID),
         "secret": str(cfg.QOBUZ_SECRET),
@@ -47,33 +48,124 @@ def _write_qobuz_config(cfg: Any, work_dir: Path) -> Path:
     return path
 
 
-def run_download(kind: str, id_: str, cfg: Any) -> Tuple[Path, List[Path]]:
-    """Run qobuz-dl for al/ar/tr. Returns (job_dir, album_dirs)."""
-    base = Path(getattr(cfg, "TEMP_DIR", "/tmp/qobuz-tg"))
-    job_dir = base / f"job-{uuid.uuid4().hex[:10]}"
-    job_dir.mkdir(parents=True, exist_ok=True)
-
-    _write_qobuz_config(cfg, job_dir)
-
-    prefix = {"album": "al-id", "artist": "ar-id", "track": "tr-id"}[kind]
+def _run_cli(prefix: str, id_: str, timeout: int) -> None:
     cmd = ["qobuz-dl", "dl", prefix, str(id_)]
-
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=int(getattr(cfg, "DOWNLOAD_TIMEOUT", 3600)),
-    )
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "qobuz-dl failed").strip()
         raise RuntimeError(err[-1500:])
 
-    album_dirs = _find_album_dirs(job_dir)
-    return job_dir, album_dirs
+
+def _list_artist_album_ids(cfg: Any, artist_id: str) -> List[str]:
+    """Reuse qobuz_info.artist_info collection logic via API."""
+    from bot.qobuz_info import _get
+
+    release_types = (
+        "album",
+        "epSingle",
+        "single",
+        "live",
+        "compilation",
+        "various-artist",
+        "download",
+    )
+    seen: set = set()
+    ordered: List[str] = []
+    for rtype in release_types:
+        offset = 0
+        for _ in range(30):
+            try:
+                data = _get(
+                    cfg,
+                    "artist/getReleasesList",
+                    artist_id=artist_id,
+                    release_type=rtype,
+                    limit=100,
+                    offset=offset,
+                    sort="release_date",
+                    track_size=1000,
+                )
+            except Exception as e:
+                log.debug("releases %s@%s: %s", rtype, offset, e)
+                break
+            items = data.get("items") or []
+            if not items:
+                break
+            for it in items:
+                aid = str(it.get("id") or it.get("qobuz_id") or "")
+                if aid and aid not in seen:
+                    seen.add(aid)
+                    ordered.append(aid)
+            if not data.get("has_more") and len(items) < 100:
+                break
+            offset += 100
+    return ordered
+
+
+def _album_label(cfg: Any, album_id: str) -> str:
+    try:
+        from bot.qobuz_info import album_info
+
+        info = album_info(cfg, album_id)
+        title = info.get("title") or album_id
+        artist = info.get("artist") or ""
+        return f"{artist} — {title}" if artist else title
+    except Exception:
+        return str(album_id)
+
+
+def run_download(
+    kind: str,
+    id_: str,
+    cfg: Any,
+    on_progress: ProgressCb = None,
+    should_cancel: CancelCb = None,
+) -> Tuple[Path, List[Path]]:
+    """Run qobuz-dl. For artists, downloads album-by-album with progress.
+
+    on_progress(current, total, label) — optional callback (sync, may be slow).
+    should_cancel() -> bool — stop early if True.
+    """
+    base = Path(getattr(cfg, "TEMP_DIR", "/tmp/qobuz-tg"))
+    job_dir = base / f"job-{uuid.uuid4().hex[:10]}"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    _write_qobuz_config(cfg, job_dir)
+    timeout = int(getattr(cfg, "DOWNLOAD_TIMEOUT", 3600))
+
+    if kind == "artist":
+        album_ids = _list_artist_album_ids(cfg, str(id_))
+        total = len(album_ids)
+        if on_progress:
+            on_progress(0, total, f"Found {total} releases")
+        if not album_ids:
+            # fallback: single ar-id call
+            _run_cli("ar-id", id_, timeout)
+            return job_dir, _find_album_dirs(job_dir)
+
+        for i, aid in enumerate(album_ids, 1):
+            if should_cancel and should_cancel():
+                log.info("artist download cancelled at %s/%s", i, total)
+                break
+            label = _album_label(cfg, aid)
+            if on_progress:
+                on_progress(i, total, label)
+            try:
+                _run_cli("al-id", aid, timeout)
+            except Exception as e:
+                log.warning("album %s failed: %s", aid, e)
+                continue
+        return job_dir, _find_album_dirs(job_dir)
+
+    prefix = {"album": "al-id", "track": "tr-id"}[kind]
+    if on_progress:
+        on_progress(0, 1, f"{kind} {id_}")
+    _run_cli(prefix, id_, timeout)
+    if on_progress:
+        on_progress(1, 1, f"{kind} {id_} done")
+    return job_dir, _find_album_dirs(job_dir)
 
 
 def _find_album_dirs(root: Path) -> List[Path]:
-    """Dirs that contain cover.jpg or audio files."""
     found: List[Path] = []
     for p in root.rglob("*"):
         if not p.is_dir():
@@ -81,11 +173,8 @@ def _find_album_dirs(root: Path) -> List[Path]:
         has_cover = (p / "cover.jpg").exists()
         has_audio = any(p.glob("*.flac")) or any(p.glob("*.mp3"))
         if has_cover or has_audio:
-            # skip parent if child is the real album folder
             found.append(p)
-    # prefer deepest dirs (actual album folders)
     found.sort(key=lambda d: len(d.parts), reverse=True)
-    # unique by keeping dirs that aren't parents of another found dir
     result: List[Path] = []
     for d in found:
         if any(d in c.parents for c in result):
@@ -95,12 +184,10 @@ def _find_album_dirs(root: Path) -> List[Path]:
 
 
 def meta_from_folder(album_dir: Path) -> Dict[str, Any]:
-    """Best-effort metadata from folder name + mutagen."""
     name = album_dir.name
     artist = album_dir.parent.name if album_dir.parent != album_dir else ""
     title, year, quality, genre = name, "", "", ""
 
-    # Pattern: "Album - 2013 [FLAC 24bit 88kHz]"
     if " - " in name and "[" in name:
         left, _, rest = name.partition(" - ")
         title = left.strip()
@@ -110,7 +197,6 @@ def meta_from_folder(album_dir: Path) -> Dict[str, Any]:
 
     tracks = len(list(album_dir.glob("*.flac"))) + len(list(album_dir.glob("*.mp3")))
 
-    # try first flac for tags
     try:
         from mutagen.flac import FLAC
 
