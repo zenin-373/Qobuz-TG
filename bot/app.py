@@ -207,22 +207,24 @@ async def _run_job(client, message, kind, id_, cfg, user_client):
     job_id = uuid.uuid4().hex[:8]
     JOBS[job_id] = {"cancel": False, "user": user_id}
 
+    # Message 1: info (stays). Message 2: progress (edited).
+    info_msg = await message.reply_text(
+        f"⏳ Fetching {kind} info…\n{id_}",
+    )
     status = await message.reply_text(
-        f"⏳ Fetching {kind} info…\n{id_}\n/stop_{job_id}",
+        f"⏳ Preparing…\n/stop_{job_id}",
     )
 
     job_dir = None
     try:
         try:
             info = await asyncio.to_thread(fetch_info, kind, id_, cfg)
-            card = info_card(kind, info) + f"\n\n/stop_{job_id}"
-            await _edit(status, card)
-            await asyncio.sleep(1.2)
+            await _edit(info_msg, info_card(kind, info))
         except Exception as e:
             log.warning("info fetch failed: %s", e)
             await _edit(
-                status,
-                f"⚠️ Could not fetch info ({e})\nContinuing download…\n/stop_{job_id}",
+                info_msg,
+                f"⚠️ Could not fetch info ({e})\nContinuing download…",
             )
 
         if JOBS[job_id]["cancel"]:
