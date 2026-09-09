@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import time
@@ -52,11 +53,34 @@ def system_footer() -> str:
             cpu = f"{psutil.cpu_percent(interval=None):.1f}%"
             vm = psutil.virtual_memory()
             ram = f"{vm.percent:.1f}%"
-            up_sec = int(time.time() - psutil.boot_time())
+            # process uptime is more useful than host boot on Heroku
+            try:
+                p = psutil.Process()
+                up_sec = int(time.time() - p.create_time())
+            except Exception:
+                up_sec = int(time.time() - psutil.boot_time())
         else:
             up_sec = 0
-        disk = shutil.disk_usage("/")
-        free = human_bytes(disk.free)
+
+        # Heroku: "/" can report 0; prefer writable work dirs
+        free_bytes = 0
+        for path in (
+            os.environ.get("TEMP_DIR"),
+            "/tmp",
+            "/app",
+            ".",
+            "/",
+        ):
+            if not path:
+                continue
+            try:
+                du = shutil.disk_usage(path)
+                if du.free > free_bytes:
+                    free_bytes = du.free
+            except Exception:
+                continue
+        free = human_bytes(free_bytes) if free_bytes else "-"
+
         if up_sec:
             h, rem = divmod(up_sec, 3600)
             m, _ = divmod(rem, 60)
@@ -67,7 +91,6 @@ def system_footer() -> str:
 
 
 def _plain(s: object) -> str:
-    """Strip any HTML-like tags from metadata/filenames."""
     t = str(s or "")
     t = re.sub(r"<[^>]*>", "", t)
     return t.replace("\n", " ").strip()
@@ -85,21 +108,31 @@ def progress_message(
     tool: str = "telegram",
     extra: str = "",
 ) -> str:
-    if total > 0:
+    indeterminate = total <= 0
+    if not indeterminate:
         pct = processed * 100.0 / total
         eta = (total - processed) / speed if speed > 0 else None
+        bar = f"{_bar(pct)} {pct:.1f}%"
+        size_line = f"Size: {human_bytes(total)}"
+        speed_line = f"Speed: {human_speed(speed) if speed else '0B/s'}"
+        eta_line = f"Estimated: {human_eta(eta)}"
+        proc_line = f"Processed: {human_bytes(processed)}"
     else:
-        pct = 0.0
-        eta = None
+        # Download via qobuz-dl has no byte progress — don't show fake 0%
+        bar = "⏳ working…"
+        size_line = "Size: (unknown until upload)"
+        speed_line = "Speed: -"
+        eta_line = "Estimated: -"
+        proc_line = "Processed: -"
 
     lines = [
         f"{action}: {_plain(name)}",
         f"by: {user_id}",
-        f"{_bar(pct)} {pct:.1f}%",
-        f"Processed: {human_bytes(processed)}",
-        f"Size: {human_bytes(total) if total else '-'}",
-        f"Speed: {human_speed(speed) if speed else '0B/s'}",
-        f"Estimated: {human_eta(eta)}",
+        bar,
+        proc_line,
+        size_line,
+        speed_line,
+        eta_line,
         f"Tool: {tool}",
     ]
     if job_id:
@@ -112,7 +145,6 @@ def progress_message(
 
 
 def info_card(kind: str, data: dict) -> str:
-    """Pre-download info panel (plain text)."""
     if kind == "album":
         lines = [
             "📀 Album info",
@@ -123,7 +155,7 @@ def info_card(kind: str, data: dict) -> str:
             f"🎧 Quality: {_plain(data.get('quality', ''))}",
             f"🏷️ Genre: {_plain(data.get('genre', ''))}",
             f"⏱ Duration: {_plain(data.get('duration', ''))}",
-            f"🆔 { _plain(data.get('id', '')) }",
+            f"🆔 {_plain(data.get('id', ''))}",
         ]
     elif kind == "track":
         lines = [
