@@ -34,7 +34,7 @@ from bot.db import (
     set_app_creds,
 )
 from bot.env_config import load_config
-from bot.poster import caption_from_album_meta, find_cover
+from bot.poster import caption_from_album_meta, find_cover, prepare_cover_jpeg
 from bot.progress import info_card, progress_message
 from bot.qobuz_info import fetch_info
 from bot.qobuz_worker import cleanup, meta_from_folder, run_download
@@ -278,12 +278,19 @@ async def _run_job(client, message, kind, id_, cfg, user_client):
                 ),
             )
 
-            async def send_poster(c=cover, cap=caption):
+            safe_cover = prepare_cover_jpeg(cover) if cover else None
+
+            async def send_poster(c=safe_cover, cap=caption):
                 if c and c.is_file():
-                    return await client.send_photo(
-                        channel, c, caption=cap[:1024],
-                        parse_mode=enums.ParseMode.HTML,
-                    )
+                    try:
+                        return await client.send_photo(
+                            channel,
+                            c,
+                            caption=cap[:1024],
+                            parse_mode=enums.ParseMode.HTML,
+                        )
+                    except Exception as pe:
+                        log.warning("send_photo failed (%s) — text caption only", pe)
                 return await client.send_message(
                     channel, cap, parse_mode=enums.ParseMode.HTML
                 )
