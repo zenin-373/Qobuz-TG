@@ -51,13 +51,18 @@ def _write_qobuz_config(cfg: Any, work_dir: Path) -> Path:
 def _run_cli(prefix: str, id_: str, timeout: int) -> None:
     cmd = ["qobuz-dl", "dl", prefix, str(id_)]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "qobuz-dl failed").strip()
-        raise RuntimeError(err[-1500:])
+    out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    # qobuz-dl sometimes exits non-zero even after tracks save (rich/warnings)
+    if proc.returncode == 0:
+        return
+    if "✓ Done!" in out or "Done!" in out:
+        log.warning("qobuz-dl exit %s but Done! seen — treating as OK", proc.returncode)
+        return
+    err = out.strip() or "qobuz-dl failed"
+    raise RuntimeError(err[-1500:])
 
 
 def _list_artist_album_ids(cfg: Any, artist_id: str) -> List[str]:
-    """Reuse qobuz_info.artist_info collection logic via API."""
     from bot.qobuz_info import _get
 
     release_types = (
@@ -121,11 +126,6 @@ def run_download(
     on_progress: ProgressCb = None,
     should_cancel: CancelCb = None,
 ) -> Tuple[Path, List[Path]]:
-    """Run qobuz-dl. For artists, downloads album-by-album with progress.
-
-    on_progress(current, total, label) — optional callback (sync, may be slow).
-    should_cancel() -> bool — stop early if True.
-    """
     base = Path(getattr(cfg, "TEMP_DIR", "/tmp/qobuz-tg"))
     job_dir = base / f"job-{uuid.uuid4().hex[:10]}"
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -138,7 +138,6 @@ def run_download(
         if on_progress:
             on_progress(0, total, f"Found {total} releases")
         if not album_ids:
-            # fallback: single ar-id call
             _run_cli("ar-id", id_, timeout)
             return job_dir, _find_album_dirs(job_dir)
 
